@@ -1,0 +1,9 @@
+target/
+build/
+backups/
+*.dat
+*.hdll
+*.dll
+*.exe
+*.raw
+NorthgardVR_log.txt

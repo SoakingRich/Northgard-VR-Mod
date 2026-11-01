@@ -1,0 +1,8 @@
+[package]
+name = "hlpatch"
+version = "0.1.0"
+edition = "2021"
+description = "Northgard VR bytecode patcher (reads hlboot.dat, writes vrboot.dat)"
+
+[dependencies]
+hlbc = { path = "../hlbc" }
