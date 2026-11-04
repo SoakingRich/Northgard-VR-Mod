@@ -1,0 +1,18 @@
+# NorthgardVR: game events -> VR notifications. Reloaded while the game runs.
+#   on <Event> <info|success|warning|danger> <seconds> <text>
+#   {1}..{6} = the event's parameters, {event} = its name. "on *" matches every event (very noisy).
+# The log (NorthgardVR_log.txt) shows events as "game event: Name(params)".
+#
+# Events the game sends (and their parameters):
+#   NewYear()                                   TimeIsInit()            ExitGame()
+#   UnitKilled(unit)                            OnNewUnit(unit)
+#   OnResourceGotten(player, resource, amount)  ResourceTrade(player, faction, resource, amount)
+#   UpdateResInventory()  ResetInventory()  UpdateRank()  UpdateEquipment()  DataChanged()
+#   DlcUnlocked(name)  OnModInstalled()  MarginChanged()  MoveWindow(bool)
+#   CloseWindow(id)  CloseSpecWindow(id)  CancelEdit(id)  UpdateObjective(obj)  OnCloseRewardWindow(reward)
+# Units show as "<Class> <kind>", e.g. "Foe Fish", players as "Player <name>".
+
+on NewYear      info     6  A new year begins
+on ResourceTrade success 5  Trade: {3} x{4}
+# on UnitKilled warning  4  Killed: {1}
+# on OnNewUnit  info     3  New unit: {1}

@@ -43,6 +43,12 @@ static void log_open(void) {
     g_log = _fsopen(path, "w", _SH_DENYNO);
 }
 
+// Release version: scripts/make_release.sh passes -DNGVR_VERSION="x.y.z"; "dev" otherwise.
+#ifndef NGVR_VERSION
+#define NGVR_VERSION "dev"
+#endif
+const char *xr_version(void) { return NGVR_VERSION " (" __DATE__ ")"; }
+
 void logf_(const char *fmt, ...) {
     if (!g_log) return;
     SYSTEMTIME st;
@@ -98,6 +104,7 @@ static int game_focused(void) {
     return pid == GetCurrentProcessId();
 }
 
+int xrt_debug(void); // xr_theater.c: "debug 1" setting enables test tooling
 static int g_dump_request;
 static int pressed(int vk) { // edge-triggered
     static SHORT prev[256];
@@ -183,7 +190,8 @@ static void dump_hl_stack(const char *why) {
 // CameraController.update, Scene.render.
 static long g_ping[4];
 HL_PRIM void HL_NAME(xr_ping_0)(void) { g_ping[0]++; }
-HL_PRIM void HL_NAME(xr_ping_1)(void) { g_ping[1]++; }
+static long long g_game_frame = -1000; // last frame Game.onUpdate or Game.render ran
+HL_PRIM void HL_NAME(xr_ping_1)(void) { g_ping[1]++; g_game_frame = g_frames; } // Game.render
 HL_PRIM void HL_NAME(xr_ping_2)(void) { g_ping[2]++; }
 HL_PRIM void HL_NAME(xr_ping_3)(void) {
     g_ping[3]++;
@@ -194,14 +202,63 @@ HL_PRIM void HL_NAME(xr_ping_3)(void) {
 // The patched h3d.Camera.update calls these for the main camera and the render
 // camera only. Values are exchanged in this fixed order:
 //   pos.xyz, target.xyz, up.xyz, fovY, screenRatio, zoom, viewX, viewY
-enum { NV = 14 };
+enum { NV = 16 }; // pos.xyz target.xyz up.xyz fovY screenRatio zoom viewX viewY zNear zFar
 static double g_cam_in[NV], g_cam_out[NV];
 static int g_out_i, g_saved_i, g_cam_pending;
 
 static long long g_cam_frame = -1000; // last frame the map camera was updated
 
 // Stereo only makes sense while the game's map camera is live (not in menus).
-int xr_game_camera_live(void) { return g_frames - g_cam_frame < 10; }
+// After "Quit to title" the old match camera keeps being updated by the menu's
+// scene, so the match itself (Game.onUpdate / Game.render) must be running too.
+// (Stopping on Game.onUpdate alone switched VR to the flat screen while the match
+// was still being torn down and the game reported an error.)
+int xr_game_camera_live(void) { return g_frames - g_cam_frame < 10 && g_frames - g_game_frame < 30; }
+
+// Render size mode: 1 = match (eye size), 0 = menus (16:9 menu size). Latched once
+// per frame with hysteresis; on a change the game gets a WM_SIZE so Heaps resizes
+// its back buffer and UI to the new size (hxd.Window.get_width/height are patched).
+// Without the resize the engine kept the menu size in the match while the mouse
+// was scaled for the eye size, so clicks on the map landed in the wrong place.
+static int g_rt_match, g_rt_seen_live;
+int xr_rt_match(void) { return g_rt_match; }
+static HWND g_game_hwnd;
+static void rt_post_resize(void) {
+    if (!g_game_hwnd) return;
+    RECT r;
+    GetClientRect(g_game_hwnd, &r);
+    PostMessageA(g_game_hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(r.right - r.left, r.bottom - r.top));
+}
+// map.LoadMap.start (hlpatch): a match is loading. Switch to the eye size now, before
+// the match's renderer is set up: resizing once the match runs leaves the building
+// preview (placement ghost) undrawn.
+HL_PRIM void HL_NAME(xr_loading)(void) {
+    g_rt_seen_live = 0;
+    if (!g_rt_match) {
+        g_rt_match = 1;
+        logf_("render size mode -> match (eye size), map loading");
+        rt_post_resize();
+    }
+}
+DEFINE_PRIM(_VOID, xr_loading, _NO_ARG);
+static void rt_mode_tick(void) {
+    static long long since;
+    int xrt_stereo_enabled(void);
+    int live = xr_game_camera_live() && xrt_stereo_enabled(); // flat mode (Ranked): the menu size, 16:9
+    if (live) g_rt_seen_live = 1;
+    // back to menus only once the match has run and its camera has stopped for 1 s
+    int want = g_rt_match ? (live || !g_rt_seen_live) : live;
+    if (!xrt_stereo_enabled()) want = 0; // flat mode: menu size even if the match never ran in 3D
+    { // the match is over (no Game updates for 2 s): a Ranked flat mode ends with it
+        void xrt_ranked_reset(void);
+        if (g_frames - g_game_frame > 144) xrt_ranked_reset();
+    }
+    if (want == g_rt_match) { since = g_frames; return; }
+    if (g_frames - since < (want ? 5 : 60)) return;
+    g_rt_match = want;
+    logf_("render size mode -> %s", want ? "match (eye size)" : "menus");
+    rt_post_resize();
+}
 
 // Pointer (controller ray) state, set by dio_frame.
 static int g_ptr_active;
@@ -311,6 +368,11 @@ static void save_settings(void) {
     logf_("settings saved: table radius %.2f m", g_table_r);
 }
 static double tab_pos[3], tab_yaw, dio_theta, dio_off[3];
+// The overview camera's screen axes (and so the game's drag-select box) follow
+// the direction you face, updated in 20 degree steps and never during a drag.
+static double g_view_yaw;
+static int g_view_yaw_set;
+float dio_view_yaw(void) { return (float)(g_view_yaw_set ? g_view_yaw : tab_yaw); }
 static int prev_grip[2], prev_upper[2];
 static double prev_hand[2][3];
 
@@ -334,7 +396,31 @@ static void quat_mul(const double a[4], const double b[4], double o[4]) {
     o[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
 }
 
+static int g_th_mode = -1;
+int dio_table_height_mode(void) {
+    if (g_th_mode < 0) {
+        g_th_mode = 0;
+        char p[MAX_PATH], line[128]; FILE *f = NULL; int v;
+        DWORD n = GetModuleFileNameA(NULL, p, MAX_PATH);
+        while (n > 0 && p[n - 1] != '\\') n--;
+        p[n] = 0; strcat_s(p, MAX_PATH, "NorthgardVR_settings.txt");
+        if (!fopen_s(&f, p, "rb") && f) {
+            while (fgets(line, sizeof(line), f)) if (sscanf_s(line, "table_height %d", &v) == 1 && v >= 0 && v <= 2) g_th_mode = v;
+            fclose(f);
+        }
+    }
+    return g_th_mode;
+}
+static void place_table(const float head[3], const float hq[4], int floor_space);
+static float g_last_head[3], g_last_hq[4] = {0, 0, 0, 1};
+static int g_last_floor, g_have_head;
+void dio_set_table_height_mode(int m) {
+    g_th_mode = m;
+    if (g_have_head) place_table(g_last_head, g_last_hq, g_last_floor); // apply now (re-centres the table)
+}
 static void place_table(const float head[3], const float hq[4], int floor_space) {
+    memcpy(g_last_head, head, sizeof(g_last_head)); memcpy(g_last_hq, hq, sizeof(g_last_hq));
+    g_last_floor = floor_space; g_have_head = 1;
     d3 f = quat_rot(hq, (d3){0, 0, -1});
     double fl = sqrt(f.x * f.x + f.z * f.z);
     if (fl < 1e-3) { f.x = 0; f.z = -1; fl = 1; }
@@ -343,7 +429,14 @@ static void place_table(const float head[3], const float hq[4], int floor_space)
     if (!g_table_r_loaded) { g_table_r_loaded = 1; load_settings(); }
     tab_pos[0] = head[0] + TABLE_AHEAD_M * f.x;
     tab_pos[2] = head[2] + TABLE_AHEAD_M * f.z;
-    tab_pos[1] = floor_space ? 0.85 : head[1] - 0.75;
+    { // VR options "Table height": 0 auto (below the head), 1 seated, 2 standing
+        int m = dio_table_height_mode();
+        double hy = head[1] - 0.75;
+        if (floor_space && m == 1) hy = 0.70;
+        else if (floor_space && m == 2) hy = 1.00;
+        else if (floor_space) hy = hy < 0.55 ? 0.55 : hy > 1.10 ? 1.10 : hy;
+        tab_pos[1] = hy;
+    }
     dio_placed = 1;
     xrt_set_panel_anchor(head, (float)tab_yaw); // UI panel follows the recentre
     logf_("diorama: table placed at (%.2f %.2f %.2f) yaw %.0f deg (%s)", tab_pos[0], tab_pos[1], tab_pos[2],
@@ -360,8 +453,7 @@ static void reset_view(void) {
 // ------------------------------------------------------------ pointer
 // While a finger rests on the right trigger, the right controller's aim ray
 // drives the game's picking. The game's mouse is held at the window centre via
-// posted mouse messages; trigger = left click, A = right click.
-static HWND g_game_hwnd;
+// posted mouse messages (buttons: see pointer_frame).
 static int g_ptr_lbtn, g_ptr_rbtn, g_ptr_logged;
 
 static BOOL CALLBACK find_game_window(HWND w, LPARAM out) {
@@ -381,6 +473,8 @@ static LARGE_INTEGER g_freq;                    // (defined with the frame timer
 static int g_dragging;                           // left/right button held and moved past the click slop
 static float g_press_hit[3], g_cur_hit[3];       // table-plane hits (play space) at press / now
 static int g_press_hit_ok, g_cur_hit_ok;
+// Where the laser meets the table plane (play space), when it's on the map and not on a panel.
+int xr_cur_hit(float p[3]) { if (!g_cur_hit_ok || !g_ptr_active) return 0; memcpy(p, g_cur_hit, 3 * sizeof(float)); return 1; }
 static void post_mouse(UINT msg) {
     if (!g_game_hwnd || !IsWindow(g_game_hwnd)) {
         g_game_hwnd = NULL;
@@ -426,7 +520,9 @@ static void log_pointer_hit(const char *what);
 // messages are dropped.
 static WNDPROC g_game_wndproc;
 static long g_leaves_dropped;
+void xrt_shutdown(const char *why); // xr_theater.c
 static LRESULT CALLBACK game_wndproc_hook(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_DESTROY) xrt_shutdown("game window closing");
     if (msg == WM_MOUSELEAVE || msg == WM_NCMOUSELEAVE) {
         LARGE_INTEGER qn;
         QueryPerformanceCounter(&qn);
@@ -488,6 +584,28 @@ __attribute__((unused)) static int cursor_over_game(void) {
 static void pose_to_world(const float pp[3], const float pq[4], d3 *pos, d3 *fwd, d3 *up);
 static int project_overview(d3 G, double W, double H, double *px, double *py);
 static d3 g_ptr_wpos, g_ptr_wfwd, g_ptr_ground;
+int xrw_terrain_z(double x, double y, double *z); // xr_uiwin.c
+int xrw_sel_mode(void);                           // xr_uiwin.c: 0 none, 1 placing a building, 2 units, 3 other
+static double g_ground_z, g_drag_z;               // terrain under the laser / drag box height (game units)
+static int g_ground_z_ok, g_drag_z_set;
+static int g_on_panel;
+// Where the laser meets the drag plane (play space): the table plane, or while
+// dragging a box the plane at the ground height where the drag started.
+static void ray_drag_plane(void) {
+    d3 dir = quat_rot(g_ptr_quat, (d3){0, 0, -1});
+    double y = tab_pos[1];
+    if (g_drag_z_set && g_world_scale > 0) y += (g_drag_z - (g_cam_in[5] + dio_off[2])) / g_world_scale;
+    g_cur_hit_ok = 0;
+    if (dir.y < -1e-3) {
+        double t = (y - g_ptr_pos[1]) / dir.y;
+        g_cur_hit[0] = (float)(g_ptr_pos[0] + t * dir.x);
+        g_cur_hit[1] = (float)y;
+        g_cur_hit[2] = (float)(g_ptr_pos[2] + t * dir.z);
+        g_cur_hit_ok = t > 0 && !g_on_panel;
+    }
+}
+int xr_cur_hit(float p[3]);
+void xr_ptr_ground(double *x, double *y) { *x = g_ptr_ground.x; *y = g_ptr_ground.y; }
 
 // Controller ray -> ground point -> pixel in the overview camera. The game's
 // mouse goes there, so its own picking (with the overview camera) finds what
@@ -497,11 +615,27 @@ static int aim_mouse(void) {
     pose_to_world(g_ptr_pos, g_ptr_quat, &pos, &fwd, &up);
     g_ptr_wpos = pos;
     g_ptr_wfwd = fwd;
-    double gz = g_cam_in[5]; // ground height ~ game camera target height
+    double gz = g_cam_in[5]; // flat ground at the game camera target height...
     if (fwd.z > -1e-4) return 0; // pointing at or above the horizon
     double t = (gz - pos.z) / fwd.z;
     if (t <= 0) return 0;
     d3 G = {pos.x + t * fwd.x, pos.y + t * fwd.y, gz};
+    g_ptr_ground = G;
+    // ...then the real terrain: a few steps along the ray (hills and valleys)
+    g_ground_z_ok = 0;
+    double z;
+    if (g_drag_z_set) z = g_drag_z;
+    else if (xrw_terrain_z(G.x, G.y, &z)) {
+        for (int k = 0; k < 4; k++) {
+            double tk = (z - pos.z) / fwd.z, zn;
+            if (tk <= 0 || !xrw_terrain_z(pos.x + tk * fwd.x, pos.y + tk * fwd.y, &zn)) break;
+            z = zn;
+        }
+        g_ground_z_ok = 1;
+    } else z = gz;
+    t = (z - pos.z) / fwd.z;
+    if (t > 0) { G.x = pos.x + t * fwd.x; G.y = pos.y + t * fwd.y; G.z = z; }
+    g_ground_z = G.z;
     g_ptr_ground = G;
     if (!g_game_hwnd) EnumWindows(find_game_window, (LPARAM)&g_game_hwnd);
     if (!g_game_hwnd) return 0;
@@ -516,7 +650,6 @@ static int aim_mouse(void) {
 
 // Controller ray on a HUD panel -> the matching UI pixel (as window px; the
 // game scales window px to engine px). Returns 0 if no panel is hit.
-static int g_on_panel;
 static int panel_mouse(void) {
     d3 dir = quat_rot(g_ptr_quat, (d3){0, 0, -1});
     float d[3] = {(float)dir.x, (float)dir.y, (float)dir.z}, ux, uy, dist;
@@ -538,18 +671,83 @@ static int panel_mouse(void) {
     return 1;
 }
 
-// Right-hand pointer. Trigger touch (or a partial pull) aims; trigger pull =
-// left click, A = right click. Presses are latched and only sent once the
+// Right-hand pointer. Trigger touch (or a partial pull) aims; A selects, the
+// trigger clicks or gives orders, B cancels a placement. Presses are latched and only sent once the
 // pointer has been aiming for a few frames, so the game has hovered along the
 // controller ray first (a quick tap from rest would otherwise click wherever
 // the desktop view pointed).
 #define PTR_SETTLE_FRAMES 3
+static void exe_dir_file(const char *name, char *out, size_t n);
 static void pointer_frame(const xr_input *in) {
     static int frames, lpend, rpend;
+    { // The laser maps onto the game window's client area: a minimised window has
+      // none, so restore it (without taking focus) while VR runs.
+        static unsigned k;
+        if (g_game_hwnd && ++k % 36 == 0 && IsIconic(g_game_hwnd)) {
+            ShowWindow(g_game_hwnd, SW_SHOWNOACTIVATE);
+            logf_("game window was minimised: restored (VR pointer needs its client area)");
+        }
+    }
     static float last_trig;
     if (fabsf(in->trigger[1] - last_trig) > 0.25f) {
         logf_("trigger %.2f (touch %d, aim valid %d)", in->trigger[1], in->trigger_touch[1], in->aim_valid[1]);
         last_trig = in->trigger[1];
+    }
+    { // Test hook: NorthgardVR_click.txt "x y [r]" in UI (engine) px clicks there (left, or right with r).
+        static int tf = -1, tx, ty, tr;
+        static unsigned k;
+        if (tf < 0 && xrt_debug() && ++k % 30 == 0) {
+            char f[MAX_PATH];
+            exe_dir_file("NorthgardVR_click.txt", f, sizeof(f));
+            FILE *fp = NULL;
+            if (!fopen_s(&fp, f, "rb") && fp) {
+                char rb[8] = {0};
+                int n = fscanf(fp, "%d %d %7s", &tx, &ty, rb);
+                fclose(fp);
+                DeleteFileA(f);
+                if (n >= 2) { tf = 0; tr = rb[0] == 'r' ? 1 : rb[0] == 'w' ? 2 : rb[0] == 'h' ? 3 : 0; logf_("test %s at (%d %d)", tr == 3 ? "hover" : tr == 2 ? "hover at world" : tr ? "right click" : "click", tx, ty); }
+            }
+        }
+        if (tf >= 0) {
+            int rw, rh;
+            RECT r;
+            if (g_game_hwnd && xrt_rt_size(&rw, &rh) && GetClientRect(g_game_hwnd, &r)) {
+                if (tr == 2) { // hover a world ground point (game units) for 10 s, no click
+                    double px, py;
+                    d3 G = {tx, ty, g_cam_in[5]};
+                    if (project_overview(G, r.right - r.left, r.bottom - r.top, &px, &py)) { g_mouse_x = (int)px; g_mouse_y = (int)py; }
+                    if (tf % 60 == 0) logf_("hover world (%d %d) -> mouse (%d %d)", tx, ty, g_mouse_x, g_mouse_y);
+                } else {
+                g_mouse_x = tx * (r.right - r.left) / rw;
+                g_mouse_y = ty * (r.bottom - r.top) / rh;
+                }
+                g_mouse_set = 1;
+                LARGE_INTEGER qn;
+                QueryPerformanceCounter(&qn);
+                g_ptr_last_use = (double)qn.QuadPart / (double)g_freq.QuadPart;
+                post_mouse(WM_MOUSEMOVE);
+                if (tr < 2 && tf == 6) post_mouse(tr ? WM_RBUTTONDOWN : WM_LBUTTONDOWN);
+                if (tr < 2 && tf == 9) post_mouse(tr ? WM_RBUTTONUP : WM_LBUTTONUP);
+            }
+            if (++tf > (tr == 3 ? 150 : tr == 2 ? 900 : 12)) tf = -1;
+            return;
+        }
+    }
+    { // Match <-> menus switch: leave the game's mouse alone for a moment. Mouse
+      // messages from the laser while the match was being torn down (title screen
+      // built at the match's render size) made the game report an error.
+        static int last_live = -1;
+        static long long changed_at = -1000;
+        int xrt_stereo_enabled(void);
+        int live = xr_game_camera_live() && xrt_stereo_enabled(); // same rule as the render size
+        if (live != last_live) { if (last_live >= 0) { changed_at = g_frames; logf_("pointer: paused for the %s switch", live ? "menus -> match" : "match -> menus"); } last_live = live; }
+        if (g_frames - changed_at < 120 || g_rt_match != live) {
+            if (g_ptr_lbtn) { g_ptr_lbtn = 0; post_mouse(WM_LBUTTONUP); }
+            if (g_ptr_rbtn) { g_ptr_rbtn = 0; post_mouse(WM_RBUTTONUP); }
+            g_ptr_active = 0;
+            frames = lpend = rpend = 0;
+            return;
+        }
     }
     if (xrt_options_input(in)) { // VR options menu (left stick click) took the laser this frame
         g_ptr_active = 0;
@@ -570,12 +768,50 @@ static void pointer_frame(const xr_input *in) {
             PostMessageA(g_game_hwnd, WM_KEYUP, VK_ESCAPE, sc | 1 | (1u << 30) | (1u << 31));
         prev_esc = esc;
     }
-    int want_l = in->trigger[1] > (g_ptr_lbtn ? 0.4f : 0.6f);
-    int want_r = in->btn_lower[1];
+    // Buttons (right hand):
+    //   A       = left button: select, drag a selection box, place a building
+    //   trigger = orders: right click while units are selected (on the map);
+    //             otherwise a left click (buildings, HUD panels, menus, placing)
+    //   B       = cancel: right click while placing a building
+    // Which button the trigger / B sends is decided when pressed and kept until released.
+    static int trig_held, trig_btn, b_btn; // trig_btn / b_btn: 0 none, 1 left, 2 right
+    int trig = in->trigger[1] > (trig_held ? 0.4f : 0.6f);
+    int sel = xrw_sel_mode();
+    if (trig && !trig_held) {
+        // A down too: A wins (the simulator also pulls the trigger with A)
+        trig_btn = in->btn_lower[1] ? 0 : (sel == 2 && overview_on() && !g_on_panel) ? 2 : 1;
+        logf_("trigger -> %s (selection: %d, on panel %d)", trig_btn == 2 ? "right click" : trig_btn ? "left click" : "nothing, A is down", sel, g_on_panel);
+    }
+    trig_held = trig;
+    if (!trig) trig_btn = 0;
+    int bdown = in->btn_upper[1];
+    if (bdown && !b_btn) b_btn = sel == 1 ? 2 : 3; // 3: pressed, nothing to cancel
+    if (!bdown) b_btn = 0;
+    int want_l = in->btn_lower[1] || trig_btn == 1;
+    int want_r = trig_btn == 2 || b_btn == 2;
     if (want_l && !g_ptr_lbtn) lpend = 1;
     if (want_r && !g_ptr_rbtn) rpend = 1;
-    int raw = in->aim_valid[1] && (in->trigger_touch[1] || in->trigger[1] > 0.05f || want_r || lpend || rpend ||
-                                   g_ptr_lbtn || g_ptr_rbtn);
+    // The laser drives the game's mouse whenever the right controller is
+    // tracked (hover and tooltips need no trigger touch). Moving the real
+    // mouse hands it back to the desktop until the controller moves again.
+    static POINT last_cur;
+    static double real_mouse_t = -10;
+    static float last_aim[4];
+    POINT cur;
+    LARGE_INTEGER qn0;
+    QueryPerformanceCounter(&qn0);
+    double now0 = (double)qn0.QuadPart / (double)g_freq.QuadPart;
+    if (GetCursorPos(&cur)) {
+        if (cur.x != last_cur.x || cur.y != last_cur.y) real_mouse_t = now0;
+        last_cur = cur;
+    }
+    float aim_move = fabsf(in->aim_quat[1][0] - last_aim[0]) + fabsf(in->aim_quat[1][1] - last_aim[1]) +
+                     fabsf(in->aim_quat[1][2] - last_aim[2]);
+    if (aim_move > 0.01f || in->trigger[1] > 0.05f || want_l || want_r) { // controller in use again
+        memcpy(last_aim, in->aim_quat[1], sizeof(last_aim));
+        if (now0 - real_mouse_t < 3.0) real_mouse_t = -10;
+    }
+    int raw = in->aim_valid[1] && (now0 - real_mouse_t > 3.0 || lpend || rpend || g_ptr_lbtn || g_ptr_rbtn);
     // The Quest's trigger-touch sensor flickers while a finger rests on it:
     // keep the pointer on for 0.5 s after the last touch, or the game's mouse
     // jumps away and back (hover sounds re-trigger, the build preview drops).
@@ -597,29 +833,42 @@ static void pointer_frame(const xr_input *in) {
         frames = lpend = rpend = 0;
         if (g_ptr_lbtn) { g_ptr_lbtn = 0; post_mouse(WM_LBUTTONUP); }
         if (g_ptr_rbtn) { g_ptr_rbtn = 0; post_mouse(WM_RBUTTONUP); }
+        g_drag_z_set = 0;
         // Leave the game's mouse where the laser last was (jumping to the
         // centre re-triggers hover effects).
         return;
     }
     frames++;
     g_mouse_set = panel_mouse() || (overview_on() && aim_mouse());
-    { // where the ray meets the table plane (for the drag box drawn in VR)
-        d3 dir = quat_rot(g_ptr_quat, (d3){0, 0, -1});
-        g_cur_hit_ok = 0;
-        if (dir.y < -1e-3) {
-            double t = (tab_pos[1] - g_ptr_pos[1]) / dir.y;
-            g_cur_hit[0] = (float)(g_ptr_pos[0] + t * dir.x);
-            g_cur_hit[1] = (float)tab_pos[1];
-            g_cur_hit[2] = (float)(g_ptr_pos[2] + t * dir.z);
-            g_cur_hit_ok = t > 0 && !g_on_panel;
-        }
+    if (!g_mouse_set && overview_on() && g_game_hwnd) {
+        // laser on nothing (sky, beyond the map): park the game's mouse over the
+        // map centre so UI hover states and tooltips close
+        RECT r;
+        GetClientRect(g_game_hwnd, &r);
+        g_mouse_x = (r.right - r.left) / 2;
+        g_mouse_y = (r.bottom - r.top) / 2;
+        g_mouse_set = 1;
     }
+    ray_drag_plane();
     post_mouse(WM_MOUSEMOVE);
     if (frames < PTR_SETTLE_FRAMES) return;
     // Down on the first settled frame after a press; up on a later frame once
     // the button is released (so even a one-frame tap is a full click).
-    if (lpend && !g_ptr_lbtn) { lpend = 0; memcpy(g_press_hit, g_cur_hit, sizeof(g_press_hit)); g_press_hit_ok = g_cur_hit_ok; g_ptr_lbtn = 1; post_mouse(WM_LBUTTONDOWN); log_pointer_hit("left click"); xrt_haptic(1, 0.35f, 25); }
-    else if (g_ptr_lbtn && !want_l) { g_ptr_lbtn = 0; post_mouse(WM_LBUTTONUP); }
+    if (lpend && !g_ptr_lbtn) {
+        lpend = 0;
+        // The selection box lies at the ground height where it starts (the
+        // terrain is uneven): from now until release the laser meets that plane.
+        g_drag_z_set = 0;
+        if (!g_on_panel && overview_on() && g_ground_z_ok) {
+            g_drag_z = g_ground_z;
+            g_drag_z_set = 1;
+            ray_drag_plane();
+            if (g_mouse_set && !g_on_panel) aim_mouse();
+        }
+        memcpy(g_press_hit, g_cur_hit, sizeof(g_press_hit)); g_press_hit_ok = g_cur_hit_ok;
+        g_ptr_lbtn = 1; post_mouse(WM_LBUTTONDOWN); log_pointer_hit("left click"); xrt_haptic(1, 0.35f, 25);
+    }
+    else if (g_ptr_lbtn && !want_l) { g_ptr_lbtn = 0; post_mouse(WM_LBUTTONUP); g_drag_z_set = 0; }
     if (rpend && !g_ptr_rbtn) { rpend = 0; g_ptr_rbtn = 1; post_mouse(WM_RBUTTONDOWN); log_pointer_hit("right click"); xrt_haptic(1, 0.6f, 45); }
     else if (g_ptr_rbtn && !want_r) { g_ptr_rbtn = 0; post_mouse(WM_RBUTTONUP); }
 }
@@ -646,11 +895,34 @@ int dio_table_info(float out[5]) {
 // Once per stereo frame, before the eyes are rendered.
 void dio_frame(const xr_input *in, const float head[3], const float hq[4], double dt) {
     if (!dio_placed) place_table(head, hq, in->floor_space);
-    // B (right): re-place the table in front of you. Y (left): reset the map view.
-    if (in->btn_upper[1] && !prev_upper[1]) place_table(head, hq, in->floor_space);
+    // Y (left): reset the map view. (Re-centring the table is the headset's own
+    // hold-the-Oculus-button; B is "cancel" in the pointer code.)
     if (in->btn_upper[0] && !prev_upper[0]) reset_view();
+    { // The game moved its own camera (unit tally, alert, minimap...): our pan
+      // offset was relative to the old spot, so drop it and land where the game
+      // wanted to look. Only at the start of a move: while it keeps moving we follow.
+        static v3 last_t;
+        static int have, still;
+        double dx = g_last_tgt.x - last_t.x, dy = g_last_tgt.y - last_t.y;
+        int moved = have && dx * dx + dy * dy > 0.01 * 0.01;
+        if (moved && still >= 10 && (dio_off[0] != 0 || dio_off[1] != 0)) {
+            logf_("diorama: game moved its camera (%.1f %.1f) -> (%.1f %.1f); pan offset (%.1f %.1f) cleared",
+                  last_t.x, last_t.y, g_last_tgt.x, g_last_tgt.y, dio_off[0], dio_off[1]);
+            dio_off[0] = dio_off[1] = dio_off[2] = 0;
+        }
+        still = moved ? 0 : still + 1;
+        last_t = g_last_tgt;
+        have = 1;
+    }
     prev_upper[0] = in->btn_upper[0];
     prev_upper[1] = in->btn_upper[1];
+    { // view direction for the overview's screen axes
+        double fx = -2 * (hq[0] * hq[2] + hq[3] * hq[1]), fz = -(1 - 2 * (hq[0] * hq[0] + hq[1] * hq[1]));
+        double hy = atan2(-fx, -fz);
+        if (!g_view_yaw_set) { g_view_yaw = tab_yaw; g_view_yaw_set = 1; }
+        double d = remainder(hy - g_view_yaw, 2 * M_PI);
+        if (fabs(d) > 20 * DEG && !g_ptr_lbtn && !g_ptr_rbtn) g_view_yaw = hy;
+    }
     pointer_frame(in);
     if (!dio_theta_set) { // need the game camera first (set by eye_camera)
         for (int h = 0; h < 2; h++) prev_grip[h] = 0;
@@ -682,6 +954,8 @@ void dio_frame(const xr_input *in, const float head[3], const float hq[4], doubl
             dio_theta += atan2(-v1z, v1x) - atan2(-v0z, v0x);
             C = d3_add(W, d3_scale(dio_M(m1), -S));
         }
+        // height: the table follows the hands' average vertical movement
+        tab_pos[1] += ((in->hand_pos[0][1] - prev_hand[0][1]) + (in->hand_pos[1][1] - prev_hand[1][1])) * 0.5;
     } else {
         for (int h = 0; h < 2; h++) {
             if (g[h] && prev_grip[h] && !g[1 - h]) { // one hand: drag the map
@@ -689,14 +963,16 @@ void dio_frame(const xr_input *in, const float head[3], const float hq[4], doubl
                 p0.y = 0;
                 d3 dh = {hl[h].x - p0.x, 0, hl[h].z - p0.z};
                 C = d3_add(C, d3_scale(dio_M(dh), -S));
+                tab_pos[1] += in->hand_pos[h][1] - prev_hand[h][1]; // and up/down: the table follows the hand
             }
         }
     }
-    // Right stick: rotate (x) and zoom (y, up = closer). Left stick y: table height.
-    double rx = in->stick[1][0], ry = in->stick[1][1], ly = in->stick[0][1];
+    // Right stick: rotate (x) and zoom (y, up = closer). Table height: grab and drag up/down.
+    double rx = in->stick[1][0], ry = in->stick[1][1];
     if (fabs(rx) > 0.2) dio_theta -= rx * 1.2 * dt;
     if (fabs(ry) > 0.2) S *= exp(-ry * 1.2 * dt);
-    if (fabs(ly) > 0.2) tab_pos[1] += ly * 0.4 * dt;
+    if (tab_pos[1] < 0.2) tab_pos[1] = 0.2;
+    if (tab_pos[1] > 2.2) tab_pos[1] = 2.2;
     // Left stick x: table size. Grow away from you (near edge stays put).
     double lxs = in->stick[0][0];
     if (fabs(lxs) > 0.3) {
@@ -750,6 +1026,7 @@ static void pose_to_world(const float pp[3], const float pq[4], d3 *pos, d3 *fwd
 
 // Eye camera for the current eye: play-space eye pose -> table local -> world,
 // with the eye's asymmetric projection.
+static double g_eye_far; // eye cameras' far plane (game units)
 static void eye_camera(const float ep[3], const float eq[4], const float tn[4]) {
     d3 eye, fwd, up;
     pose_to_world(ep, eq, &eye, &fwd, &up);
@@ -761,8 +1038,23 @@ static void eye_camera(const float ep[3], const float eq[4], const float tn[4]) 
                     m22 / m11,                                        // screenRatio
                     1.0,                                              // zoom
                     -(tr + tl) / (tr - tl),                           // viewX (off-centre)
-                    -(tu + td) / (tu - td)};                          // viewY
+                    -(tu + td) / (tu - td),                           // viewY
+                    g_cam_in[14],                                     // zNear (game's)
+                    g_eye_far};                                       // zFar
     memcpy(g_cam_out, o, sizeof(o));
+}
+
+// The game sets its far plane for its own camera, which ends the map in a hard
+// straight edge that swings around as you turn your head. The eye cameras use a
+// longer one, and the mask shader fades the image out with distance (a circle
+// around you) before the far plane is reached.
+#define EYE_FAR_MUL 1.6
+int dio_fade_m(float out[2]) {
+    if (g_eye_far <= 0 || g_world_scale <= 0) return 0;
+    double far_m = g_eye_far / g_world_scale;
+    out[0] = (float)(far_m * 0.55); // fade start (metres from the eye)
+    out[1] = (float)(far_m * 0.90); // fully faded, safely before the far plane
+    return 1;
 }
 
 // Overview camera. While VR stereo runs, the game's main camera looks straight
@@ -789,8 +1081,13 @@ static void overview_camera(void) {
     double rfrac = OV_SAFE_FRAC * (ratio < 1 ? ratio : 1);
     double H = OV_HEIGHT, t = R / (H * rfrac), fov = 2 * atan(t) / DEG;
     if (fov > 150) { fov = 150; H = R / (tan(75 * DEG) * rfrac); }
-    d3 F = dio_F(); // screen up = away from you on the table
-    double o[NV] = {C.x, C.y, C.z + H, C.x, C.y, C.z, F.x, F.y, 0, fov, ratio, 1.0, 0, 0};
+    d3 F = dio_F(); // screen up = away from you on the table...
+    { // ...turned to the direction you face
+        double a = dio_view_yaw() - tab_yaw;
+        d3 Fv = dio_F(), Rv = {-Fv.y, Fv.x, 0};
+        F = d3_add(d3_scale(Rv, -sin(a)), d3_scale(Fv, cos(a)));
+    }
+    double o[NV] = {C.x, C.y, C.z + H, C.x, C.y, C.z, F.x, F.y, 0, fov, ratio, 1.0, 0, 0, g_cam_in[14], g_cam_in[15]};
     memcpy(g_ov, o, sizeof(o));
     memcpy(g_cam_out, o, sizeof(o));
     g_ov_valid = 1;
@@ -823,9 +1120,10 @@ static int project_overview(d3 G, double W, double Hp, double *px, double *py) {
 
 static void log_pointer_hit(const char *what) {
     d3 P = g_ptr_wpos, F = g_ptr_wfwd;
-    logf_("pointer %s: ray from (%.1f %.1f %.1f) dir (%.2f %.2f %.2f) hits ground at (%.1f %.1f); "
+    logf_("pointer %s: ray from (%.1f %.1f %.1f) dir (%.2f %.2f %.2f) hits ground at (%.1f %.1f %.1f)%s; "
           "table centre (%.1f %.1f) scale %.0f; mouse %s (%d %d)",
-          what, P.x, P.y, P.z, F.x, F.y, F.z, g_ptr_ground.x, g_ptr_ground.y,
+          what, P.x, P.y, P.z, F.x, F.y, F.z, g_ptr_ground.x, g_ptr_ground.y, g_ptr_ground.z,
+          g_drag_z_set ? " (drag plane)" : g_ground_z_ok ? " (terrain)" : " (flat)",
           g_cam_in[3] + dio_off[0], g_cam_in[4] + dio_off[1], g_world_scale,
           g_mouse_set ? (g_on_panel ? "on HUD panel at" : "at") : "OFF-VIEW, centre", g_mouse_x, g_mouse_y);
 }
@@ -847,17 +1145,27 @@ static void orbit_camera(void) {
 }
 
 HL_PRIM void HL_NAME(xr_cam_compute)(double a0, double a1, double a2, double a3, double a4, double a5, double a6,
-                                     double a7, double a8, double a9, double a10, double a11, double a12, double a13) {
-    double in[NV] = {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13};
+                                     double a7, double a8, double a9, double a10, double a11, double a12, double a13,
+                                     double a14, double a15) {
+    double in[NV] = {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15};
     memcpy(g_cam_in, in, sizeof(in));
     memcpy(g_cam_out, in, sizeof(in));
     g_last_pos.x = a0; g_last_pos.y = a1; g_last_pos.z = a2;
     g_last_tgt.x = a3; g_last_tgt.y = a4; g_last_tgt.z = a5;
+    if (a15 > 1 && a15 < 1e6) {
+        g_eye_far = a15 * EYE_FAR_MUL;
+        static double logged_far;
+        if (fabs(g_eye_far - logged_far) > 0.2 * logged_far) {
+            logged_far = g_eye_far;
+            logf_("far plane: game %.0f units, eyes %.0f (fade %.2f-%.2f m at scale %.0f)", a15, g_eye_far,
+                  g_eye_far / g_world_scale * 0.55, g_eye_far / g_world_scale * 0.90, g_world_scale);
+        }
+    }
     static int logged;
     if (!logged) {
         logged = 1;
         logf_("main camera: pos(%.2f %.2f %.2f) target(%.2f %.2f %.2f) up(%.2f %.2f %.2f) fovY=%.2f ratio=%.3f "
-              "zoom=%.2f view(%.3f %.3f)", a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13);
+              "zoom=%.2f view(%.3f %.3f) near %.2f far %.1f", a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15);
     }
     float ep[3], eq[4], tn[4];
     if (xr_current_eye(ep, eq, tn)) eye_camera(ep, eq, tn);
@@ -903,29 +1211,62 @@ static void log_processes(void) {
 // The Meta XR Simulator app is started by the game process, so Steam counts it
 // as part of the game and shows "Stopping" until it closes. Close it whenever
 // the game exits or restarts (and leftovers at startup).
-static void kill_simulators(void) {
+
+// Close the processes this game started (and theirs): Steam counts them as
+// part of the game and shows "Running"/"Stopping" until they are gone.
+static void kill_children(DWORD parent, int depth) {
+    if (depth > 4) return;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(pe);
+    DWORD kids[32];
+    int nk = 0;
+    for (BOOL ok = Process32First(snap, &pe); ok; ok = Process32Next(snap, &pe)) {
+        if (pe.th32ParentProcessID != parent || pe.th32ProcessID == parent || nk >= 32) continue;
+        kids[nk++] = pe.th32ProcessID;
+        logf_("  child process %s pid=%lu (parent %lu)", pe.szExeFile, pe.th32ProcessID, parent);
+    }
+    CloseHandle(snap);
+    for (int i = 0; i < nk; i++) {
+        kill_children(kids[i], depth + 1);
+        HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, kids[i]);
+        BOOL done = h && TerminateProcess(h, 0);
+        if (h) CloseHandle(h);
+        logf_("  closed pid=%lu: %s", kids[i], done ? "ok" : "failed");
+    }
+}
+
+// Debug: log every process started after this game (to find what keeps Steam on "Running").
+static void log_newer_processes(void) {
+    FILETIME me, a, b, c;
+    if (!GetProcessTimes(GetCurrentProcess(), &me, &a, &b, &c)) return;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
     PROCESSENTRY32 pe;
     pe.dwSize = sizeof(pe);
     for (BOOL ok = Process32First(snap, &pe); ok; ok = Process32Next(snap, &pe)) {
-        if (_stricmp(pe.szExeFile, "MetaXRSimulator.exe") != 0) continue;
-        HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-        BOOL done = h && TerminateProcess(h, 0);
-        if (h) CloseHandle(h);
-        logf_("  closed MetaXRSimulator.exe pid=%lu: %s", pe.th32ProcessID, done ? "ok" : "failed");
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+        if (!h) continue;
+        FILETIME cr;
+        if (GetProcessTimes(h, &cr, &a, &b, &c) && CompareFileTime(&cr, &me) >= 0)
+            logf_("  newer process %s pid=%lu parent=%lu", pe.szExeFile, pe.th32ProcessID, pe.th32ParentProcessID);
+        CloseHandle(h);
     }
     CloseHandle(snap);
 }
 
-// End this game (and the simulator) right now.
+// End this game right now (VR shut down first, then the processes it started).
+// The simulator is started detached in debug mode and keeps running.
 static void quit_now(const char *why) {
     logf_("quitting: %s", why);
-    kill_simulators();
+    if (strcmp(why, "watchdog")) xrt_shutdown(why); // (a hung frame loop may hold the runtime)
+    kill_children(GetCurrentProcessId(), 0);
     TerminateProcess(GetCurrentProcess(), 0);
 }
 
 static void kill_other_instances(void) {
+    if (!xrt_debug()) return;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
     PROCESSENTRY32 pe;
@@ -968,7 +1309,105 @@ static void exe_dir_file(const char *name, char *out, size_t n) {
     strcat_s(out, n, name);
 }
 
+
+// Debug: run a command line through the Task Scheduler service, so the new
+// process is not a descendant of the game. Steam tracks the game's descendants
+// and its process tracker freezes on one of the Meta XR Simulator's helpers
+// (Steam then stays on "Running"/"Stopping"), so the simulator is started this way.
+int xr_run_detached(const char *task, const char *cmdline) {
+    char cmdf[MAX_PATH], cmd[2048];
+    DWORD tl = GetTempPathA(sizeof(cmdf), cmdf);
+    if (!tl || tl > MAX_PATH - 40) return 0;
+    sprintf_s(cmdf + tl, sizeof(cmdf) - tl, "%s.cmd", task); // %TEMP%: no spaces for schtasks /TR
+    FILE *f = NULL;
+    if (fopen_s(&f, cmdf, "wb") || !f) { logf_("cannot write %s", cmdf); return 0; }
+    fprintf(f, "@echo off\r\nstart \"\" %s\r\n", cmdline);
+    fclose(f);
+    int ok = 1;
+    for (int step = 0; step < 2 && ok; step++) {
+        if (step == 0)
+            sprintf_s(cmd, sizeof(cmd), "schtasks /Create /TN %s /TR %s /SC ONCE /ST 00:00 /F", task, cmdf);
+        else
+            sprintf_s(cmd, sizeof(cmd), "schtasks /Run /TN %s", task);
+        STARTUPINFOA si = {sizeof(si)};
+        PROCESS_INFORMATION pi;
+        DWORD code = 1;
+        if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, 10000);
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        ok = code == 0;
+    }
+    logf_("scheduled task %s (%s): %s", task, cmdline, ok ? "started" : "FAILED");
+    return ok;
+}
+
+
+// Debug: a watcher script outside the game (started through Task Scheduler,
+// keeps running when the game is closed or hung). Flag files in the game folder:
+//   NorthgardVR_kill.flag   force-end Northgard.exe (like Task Manager's End task)
+//   NorthgardVR_steam.flag  shut Steam down (forced if needed) and start it again
+//   NorthgardVR_launch.flag start Northgard through Steam
+//   NorthgardVR_launcher.flag start NorthgardVR.exe (the VR launcher)
+//   NorthgardVR_setup.flag    run NorthgardVR_release_test\NorthgardVR_Setup.exe with the flag's text as arguments
+// It logs to NorthgardVR_watch.log and touches NorthgardVR_watch.alive every second.
+static void ensure_watcher(void) {
+    char dir[MAX_PATH], alive[MAX_PATH], ps1[MAX_PATH], line[MAX_PATH + 96];
+    exe_dir_file("", dir, sizeof(dir));
+    exe_dir_file("NorthgardVR_watch.alive", alive, sizeof(alive));
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExA(alive, GetFileExInfoStandard, &fa)) {
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        ULONGLONG a = ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+        ULONGLONG n = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+        char v[64] = ""; FILE *af = NULL;
+        if (!fopen_s(&af, alive, "rb") && af) { fgets(v, sizeof(v), af); fclose(af); }
+        if (n > a && n - a < 10ULL * 10000000ULL && !strncmp(v, "v3", 2)) { logf_("watcher already running"); return; }
+    }
+    DWORD tl = GetTempPathA(sizeof(ps1), ps1);
+    if (!tl || tl > MAX_PATH - 32) return;
+    strcat_s(ps1, sizeof(ps1), "NorthgardVR_watch.ps1");
+    size_t dl = strlen(dir);
+    if (dl && dir[dl - 1] == '\\') dir[dl - 1] = 0;
+    FILE *f = NULL;
+    if (fopen_s(&f, ps1, "wb") || !f) { logf_("cannot write %s", ps1); return; }
+    fprintf(f,
+        "$d = '%s'\r\n"
+        "$log = Join-Path $d 'NorthgardVR_watch.log'\r\n"
+        "function L($m) { \"$(Get-Date -Format 'HH:mm:ss') $m\" | Add-Content $log }\r\n"
+        "$steam = (Get-ItemProperty 'HKCU:\\Software\\Valve\\Steam').SteamExe\r\n"
+        "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*NorthgardVR_watch*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; L \"replaced older watcher $($_.ProcessId)\" }\r\n"
+        "L \"watcher v3 started (pid $PID, steam $steam)\"\r\n"
+        "while ($true) {\r\n"
+        "  \"v3 $((Get-Date).ToString())\" | Set-Content (Join-Path $d 'NorthgardVR_watch.alive')\r\n"
+        "  $u = Join-Path $d 'NorthgardVR_setup.flag'\r\n"
+        "  if (Test-Path $u) { $a = (Get-Content $u -Raw); Remove-Item $u -Force; $p = Start-Process (Join-Path $d 'NorthgardVR_release_test\\NorthgardVR_Setup.exe') -ArgumentList \"$a\" -PassThru -Wait; L \"setup $a exit $($p.ExitCode)\" }\r\n"
+        "  $r = Join-Path $d 'NorthgardVR_launcher.flag'\r\n"
+        "  if (Test-Path $r) { Remove-Item $r -Force; Start-Process (Join-Path $d 'NorthgardVR.exe') -WorkingDirectory $d; L 'launcher started' }\r\n"
+        "  $k = Join-Path $d 'NorthgardVR_kill.flag'\r\n"
+        "  if (Test-Path $k) { Remove-Item $k -Force; $p = Get-Process Northgard -ErrorAction SilentlyContinue;\r\n"
+        "    if ($p) { $p | Stop-Process -Force; Start-Sleep 2; L \"killed Northgard ($($p.Id -join ',')); still running: $([bool](Get-Process Northgard -ErrorAction SilentlyContinue))\" } else { L 'kill: Northgard not running' } }\r\n"
+        "  $s = Join-Path $d 'NorthgardVR_steam.flag'\r\n"
+        "  if (Test-Path $s) { Remove-Item $s -Force; L 'steam restart: shutting down';\r\n"
+        "    Get-Process Northgard -ErrorAction SilentlyContinue | Stop-Process -Force\r\n"
+        "    Start-Process $steam -ArgumentList '-shutdown'\r\n"
+        "    for ($i = 0; $i -lt 30 -and (Get-Process steam -ErrorAction SilentlyContinue); $i++) { Start-Sleep 1 }\r\n"
+        "    if (Get-Process steam -ErrorAction SilentlyContinue) { L 'steam did not exit in 30 s: forcing'; Get-Process steam,steamwebhelper -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep 3 }\r\n"
+        "    Start-Process $steam; L 'steam started' }\r\n"
+        "  $l = Join-Path $d 'NorthgardVR_launch.flag'\r\n"
+        "  if (Test-Path $l) { Remove-Item $l -Force; Start-Process 'steam://rungameid/466560'; L 'launch requested' }\r\n"
+        "  Start-Sleep 1\r\n"
+        "}\r\n", dir);
+    fclose(f);
+    sprintf_s(line, sizeof(line), "conhost.exe --headless powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File %s", ps1); // no window to close
+    xr_run_detached("NorthgardVR_watch", line);
+}
+
 static void check_restart_flag(void) {
+    if (!xrt_debug()) return;
     char flag[MAX_PATH], exe[MAX_PATH], dir[MAX_PATH];
     // NorthgardVR_quit.flag: close the game (and the simulator).
     exe_dir_file("NorthgardVR_quit.flag", flag, sizeof(flag));
@@ -1001,7 +1440,8 @@ static void check_restart_flag(void) {
     STARTUPINFOA si = {sizeof(si)};
     PROCESS_INFORMATION pi;
     logf_("restart flag found: starting a fresh instance and exiting");
-    kill_simulators();
+    xrt_shutdown("restart");
+    kill_children(GetCurrentProcessId(), 0);
     if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, DETACHED_PROCESS, NULL, dir, &si, &pi)) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
@@ -1042,21 +1482,23 @@ HL_PRIM void HL_NAME(xr_smoke)(void) {
         log_open();
         QueryPerformanceFrequency(&g_freq);
         g_tLast = g_tPrev = now;
-        logf_("NorthgardVR openxr.hdll loaded; xr_smoke called from hxd.System.mainLoop");
+        logf_("NorthgardVR %s loaded; xr_smoke called from hxd.System.mainLoop", xr_version());
         CloseHandle(CreateThread(NULL, 0, watchdog, NULL, 0, NULL));
         log_openxr_runtime();
         hl_api_init();
+        if (xrt_debug()) logf_("debug mode on: test tooling enabled");
         log_processes();
         kill_other_instances();
-        kill_simulators(); // leftovers from an earlier run
-        logf_("camtest ready: F9 override, F10 auto-orbit, Numpad 4/6 yaw, 8/2 pitch, +/- zoom, 5 reset");
+        if (xrt_debug()) ensure_watcher();
+        if (xrt_debug()) logf_("camtest ready: F9 override, F10 auto-orbit, Numpad 4/6 yaw, 8/2 pitch, +/- zoom, 5 reset");
     }
     double dt = (double)(now.QuadPart - g_tPrev.QuadPart) / g_freq.QuadPart;
     g_tPrev = now;
     if (dt > 0.1) dt = 0.1;
-    poll_keys(dt);
+    if (xrt_debug()) poll_keys(dt);
     if (g_frames % 30 == 0) check_restart_flag();
     g_frames++;
+    rt_mode_tick();
     if (g_frames % 600 == 0) {
         double span = (double)(now.QuadPart - g_tLast.QuadPart) / g_freq.QuadPart;
         logf_("frame %lld  (%.1f fps)  main cam upd %ld  pos(%.1f %.1f %.1f) target(%.1f %.1f %.1f)  "
@@ -1128,7 +1570,17 @@ DEFINE_PRIM(_VOID, xr_ui_target, _ABSTRACT(dx_resource));
 // Phase 1: called with the game's back buffer right before every present.
 HL_PRIM void HL_NAME(xr_frame)(void *backbuffer) { xr_theater_frame(backbuffer); }
 HL_PRIM void HL_NAME(xr_ui_windows)(vdynamic *ui) { xr_ui_windows_impl(ui); }
+void xr_game_impl(void *game); // xr_uiwin.c
+HL_PRIM void HL_NAME(xr_game)(vdynamic *g) { g_game_frame = g_frames; xr_game_impl(g); }
+DEFINE_PRIM(_VOID, xr_game, _DYN);
 DEFINE_PRIM(_VOID, xr_ui_windows, _DYN);
+HL_PRIM void HL_NAME(xr_game_event)(vdynamic *e) { xr_game_event_impl(e); }
+DEFINE_PRIM(_VOID, xr_game_event, _DYN);
+// Patched in at the start of hxd.System.exit (Quit): end VR cleanly first.
+HL_PRIM void HL_NAME(xr_exiting)(void) { xrt_shutdown("game exit"); }
+DEFINE_PRIM(_VOID, xr_exiting, _NO_ARG);
+HL_PRIM void HL_NAME(xr_weather)(vdynamic *w) { xr_weather_impl(w); }
+DEFINE_PRIM(_VOID, xr_weather, _DYN);
 
 DEFINE_PRIM(_VOID, xr_smoke, _NO_ARG);
 DEFINE_PRIM(_VOID, xr_frame, _ABSTRACT(dx_resource));
@@ -1138,7 +1590,7 @@ DEFINE_PRIM(_VOID, xr_ping_2, _NO_ARG);
 DEFINE_PRIM(_VOID, xr_ping_3, _NO_ARG);
 DEFINE_PRIM(_BOOL, xr_cam_active, _NO_ARG);
 DEFINE_PRIM(_VOID, xr_mark_main, _NO_ARG);
-DEFINE_PRIM(_VOID, xr_cam_compute, _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64);
+DEFINE_PRIM(_VOID, xr_cam_compute, _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64);
 DEFINE_PRIM(_F64, xr_out_next, _NO_ARG);
 DEFINE_PRIM(_BOOL, xr_cam_restore, _NO_ARG);
 DEFINE_PRIM(_F64, xr_saved_next, _NO_ARG);

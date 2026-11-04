@@ -7,3 +7,4 @@ backups/
 *.exe
 *.raw
 NorthgardVR_log.txt
+dist/

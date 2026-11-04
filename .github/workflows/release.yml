@@ -1,0 +1,35 @@
+# Builds the NorthgardVR release zip on every push and pull request (as a downloadable
+# artifact), and attaches it to a GitHub Release when a tag like v0.1.0 is pushed.
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools (MinGW, Rust Windows target, Python)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 zip python3-numpy python3-pil
+          rustup target add x86_64-pc-windows-gnu
+      - name: Build
+        run: |
+          VER="${GITHUB_REF_NAME//\//-}"
+          scripts/make_release.sh "$VER"
+          echo "ZIP=dist/NorthgardVR-$VER.zip" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NorthgardVR
+          path: ${{ env.ZIP }}
+      - name: GitHub Release (tags only, marked as pre-release)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$ZIP" --title "NorthgardVR $GITHUB_REF_NAME" --prerelease --generate-notes

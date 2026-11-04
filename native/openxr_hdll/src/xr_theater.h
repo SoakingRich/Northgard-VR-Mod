@@ -6,6 +6,8 @@ typedef struct {
     int floor_space;           // play space origin is on the floor (STAGE)
     int hand_valid[2];         // 0 = left, 1 = right
     float hand_pos[2][3];
+    float hand_quat[2][4];     // grip orientation
+    int hand_quat_valid[2];
     float grip[2], trigger[2];
     float stick[2][2];
     int btn_lower[2];          // X (left) / A (right)

@@ -668,3 +668,34 @@ another headset/eye size, the game's UI scale, language, clan or patches. So:
 - **Known issue:** the HUD panels' semi-transparent backgrounds blend with the key
   colour (pinkish), so VD may half-key them or leave a pink tint. Fix if seen on the
   Quest: draw the panels with opaque backgrounds in chroma mode.
+
+## VR notifications (2026-11-02 11:20, openxr_41)
+
+- **Panel:** a mod-styled toast panel (Consolas, dark cards, coloured accent bar,
+  "VR MOD // INFO|OK|WARNING|ALERT" tag), drawn with GDI into its own swapchain
+  (premultiplied alpha, fades).
+  - Up to 4 cards, newest on top; laser + trigger dismisses a card; haptic pulse per
+    message by severity.
+  - In a match it's world-locked at the `vr_notify @notify` layout line (p = top
+    centre). Default `0.50 0.42 0.40 yaw -40 pitch -12 width 0.40`: front-right, close
+    to you.
+  - In menus it sits to the right of the menu screen.
+- **Sources:**
+  - `vr_notify()` in mod code: "NorthgardVR ready", mixed-reality changes
+  - `NorthgardVR_notify.txt`: polled every 30 frames, consumed
+  - game events via hlpatch `patch_game_events`: `EventManager.dispatchEvent(GameEvent)`
+    → `xr_game_event`
+    - The native side decodes the enum constructor name and its params: ints, floats,
+      bools, enums, Strings, and objects as `Class#id name/kind`.
+    - Each event kind is logged the first 5 times.
+    - Rules in `NorthgardVR_notify_rules.txt` (`on <Event> <kind> <sec> <text {1}..>`)
+- **GameEvent has only 21 constructors** (`hlpatch enum GameEvent`):
+  - gameplay: NewYear, UnitKilled, OnNewUnit, OnResourceGotten, ResourceTrade
+  - the rest are UI/housekeeping
+  - `on *` fired 2,363 times in a minute, mostly OnResourceGotten
+  - Raids, winter warnings and similar alerts are not GameEvents; they come through the
+    game's own notification feed (`ui.win.Notifications` / `ui.win.Notify`). Next step:
+    hook that feed so its messages can be filtered and turned into VR notifications.
+- **Verified in the simulator** (`12_vr_notifications`, `13_notifications_in_match`):
+  file messages in menus and a match, all four styles, laser dismiss, event decoding
+  (`OnResourceGotten(Player Haxe, Wood, 250)`, `UnitKilled(Crow Crow)`).

@@ -9,29 +9,38 @@
 #                   Comma-separated class names; a trailing * matches a prefix.
 #                   Several windows -> their union. Exact names are matched before
 #                   wildcards, and each window goes to one panel only.
-#   @rest           every other visible window (Lore, tips, pause, dialogs, ...).
+#   @rest           the largest other visible window (Lore, pause, dialogs, ...); a second @rest line takes the next largest.
 #   @win:tip        the hover tooltip; it pops up just above where the laser meets a panel.
 #   lt/ct/rt/lb/...  a fixed rect (x y w h, UI px) measured from that corner of the UI image.
-# For @win/@rest panels x y h are unused, w is a nominal width in UI px and width_m the
+# For @win/@rest panels x y h are unused (for @win with h > 0, x y w h crop that part of the
+# window, for full-screen windows like Pause), w is a nominal width in UI px and width_m the
 # metres it gets (sets the scale), and p is the panel's BOTTOM centre.
 # p = position in table space, metres: x right, y up, z towards you (for a 0.75 m table;
 #   scaled with the table size). pitch -90 = lying flat.
 #
 # claim <classes>: windows that no panel shows (and @rest leaves out).
-claim ui.sel.Resources,ui.win.CooldownInfo
+claim ui.sel.Resources,ui.win.CooldownInfo,ui.win.Pause
 #
 # far side, above the table (top bar: fixed rects, it spans the whole screen width)
 economy       rt  -1000  0  1000  36    0.05   0.50 -0.92    0    -10   1.60
 fame_left     lt      0  0   160  36   -1.00   0.48 -0.72   30    -10   0.24
-center        @rest   0  0  1300   0    0.00   0.56 -1.05    0     -5   1.10
+tips          @win:ui.win.Tuto   0 0 1300 0    0.00 0.56 -1.05    0     -5   1.10
+# Lore, pause, dialogs and anything else: big, in front of you above the table
+center        @rest   0  0  1300   0    0.00   0.40 -0.05    0     -8   1.20
+center2       @rest   0  0  1300   0    0.55   0.40 -0.15  -25   -8   1.20
 selection     @win:ui.win.SelectedUnitsInfos,ui.win.EntityInfos,ui.sel.*   0 0 640 0   -0.32 0.08 -0.90    0  -10  0.70
 territory     @win:ui.sel.ZoneInfos   0 0 320 0    0.42 0.08 -0.88  -10  -10  0.35
 # far left
 players       @win:ui.sel.Players     0 0 170 0   -1.02 0.19 -0.68   35  -15  0.26
 notifications @win:ui.win.Notifications,ui.win.Notify,ui.win.WarNotify  0 0 430 0   -1.06 0.40 -0.80   30   -5  0.42
-# near sides, tilted towards you; the build menu sits right next to the unit tallies
+# near left side, tilted towards you
 left_hud      @win:ui.win.MiniMap,ui.win.Calendar,ui.win.CalendarTimers   0 0 275 0   -0.98 -0.14 -0.08   35  -35  0.34
-right_hud     @win:ui.win.units.AllUnits,ui.win.BuildButton   0 0 284 0    0.96 -0.06 -0.10  -35  -35  0.34
-build_menu    @win:ui.win.BuildWindow   0 0 284 0    1.25 -0.06  0.11  -35  -35  0.34
+# on the LEFT HAND (13th column "lhand": p/yaw/pitch relative to the controller grip;
+#   x right, y up, z towards the wrist). Unit tallies, with the build menu beside them.
+right_hud     @win:ui.win.units.AllUnits,ui.win.BuildButton   0 0 284 0   -0.02 0.05 0.03    0  -20  0.17  lhand
+build_menu    @win:ui.win.BuildWindow   0 0 284 0    0.16 0.05 0.03  -20  -20  0.17  lhand
 # hover tooltips (follows the laser; this position is only a fallback)
 tip           @win:tip   0 0 300 0    0.00 0.30 -0.80    0  -10  0.30
+cursor        @win:cursor   0 0 300 0    0 0 0    0  0  0.36
+# VR notifications (mod messages): p = TOP centre of the message stack; width_m sets the size.
+vr_notify     @notify  0 0 0 0    0.50 0.42  0.40  -40  -12  0.40

@@ -111,7 +111,7 @@ fn patch_smoke(code: &mut Bytecode) {
 ///
 /// h3d.Camera.update prologue (for the main camera and the render camera):
 ///   if (xr_cam_active()) {
-///     xr_cam_compute(pos.xyz, target.xyz, up.xyz, fovY, screenRatio, zoom, viewX, viewY);
+///     xr_cam_compute(pos.xyz, target.xyz, up.xyz, fovY, screenRatio, zoom, viewX, viewY, zNear, zFar);
 ///     pos.x = xr_out_next(); ... viewY = xr_out_next();   // same order
 ///   }
 /// before every return:
@@ -124,11 +124,11 @@ fn patch_camtest(code: &mut Bytecode) -> hlbc::types::RefGlobal {
     let bool_t = type_index(code, &Type::Bool);
     let f64_t = type_index(code, &Type::F64);
     let cam_active = add_native(code, &xr_lib(), "xr_cam_active", vec![], bool_t);
-    // xr_cam_compute(14 values) / xr_out_next() / xr_saved_next(): the native
+    // xr_cam_compute(16 values) / xr_out_next() / xr_saved_next(): the native
     // side receives the camera state, then hands back the values to use (and
     // later the originals to restore) one at a time in the same order:
-    // pos.xyz, target.xyz, up.xyz, fovY, screenRatio, zoom, viewX, viewY.
-    let cam_compute = add_native(code, &xr_lib(), "xr_cam_compute", vec![f64_t; 14], void_t);
+    // pos.xyz, target.xyz, up.xyz, fovY, screenRatio, zoom, viewX, viewY, zNear, zFar.
+    let cam_compute = add_native(code, &xr_lib(), "xr_cam_compute", vec![f64_t; 16], void_t);
     let out_next = add_native(code, &xr_lib(), "xr_out_next", vec![], f64_t);
     let cam_restore = add_native(code, &xr_lib(), "xr_cam_restore", vec![], bool_t);
     let saved_next = add_native(code, &xr_lib(), "xr_saved_next", vec![], f64_t);
@@ -208,7 +208,7 @@ fn patch_camtest(code: &mut Bytecode) -> hlbc::types::RefGlobal {
     let (pos_f, vec_t) = field_index(code, "h3d.Camera", "pos");
     let (target_f, _) = field_index(code, "h3d.Camera", "target");
     let (up_f, _) = field_index(code, "h3d.Camera", "up");
-    let scalars: Vec<RefField> = ["fovY", "screenRatio", "zoom", "viewX", "viewY"]
+    let scalars: Vec<RefField> = ["fovY", "screenRatio", "zoom", "viewX", "viewY", "zNear", "zFar"]
         .iter()
         .map(|n| field_index(code, "h3d.Camera", n).0)
         .collect();
@@ -221,7 +221,7 @@ fn patch_camtest(code: &mut Bytecode) -> hlbc::types::RefGlobal {
     let mc = new_reg(code, up, cam_t);
     let b = new_reg(code, up, bool_t);
     let vecs = [new_reg(code, up, vec_t), new_reg(code, up, vec_t), new_reg(code, up, vec_t)];
-    let vals: Vec<Reg> = (0..14).map(|_| new_reg(code, up, f64_t)).collect();
+    let vals: Vec<Reg> = (0..16).map(|_| new_reg(code, up, f64_t)).collect();
     let n = new_reg(code, up, f64_t);
     let v = new_reg(code, up, void_t);
     let vec_fields = [pos_f, target_f, up_f];
@@ -660,6 +660,74 @@ fn patch_ui_windows(code: &mut Bytecode) {
     );
 }
 
+/// Game events for VR notifications: at the start of EventManager.dispatchEvent,
+/// pass the GameEvent enum value (as a plain pointer) to xr_game_event.
+fn patch_game_events(code: &mut Bytecode) {
+    let void_t = type_index(code, &Type::Void);
+    let dyn_t = type_index(code, &Type::Dyn);
+    let fp = find_method(code, "EventManager", "dispatchEvent");
+    let nat = add_native(code, &xr_lib(), "xr_game_event", vec![dyn_t], void_t);
+    let d = new_reg(code, fp, dyn_t);
+    let v = new_reg(code, fp, void_t);
+    inject::insert_ops(
+        &mut code.functions[fp],
+        vec![(0, vec![Opcode::UnsafeCast { dst: d, src: Reg(1) }, Opcode::Call1 { dst: v, fun: nat, arg0: d }])],
+    );
+}
+
+/// Weather particles (snow, rain, ash...) follow the camera, which in VR looks
+/// like a smear on your eyes: after every map.Weather.update, xr_weather(this)
+/// can hide their root (VR options menu).
+fn patch_weather(code: &mut Bytecode) {
+    let void_t = type_index(code, &Type::Void);
+    let dyn_t = type_index(code, &Type::Dyn);
+    let fp = find_method(code, "map.Weather", "update");
+    let nat = add_native(code, &xr_lib(), "xr_weather", vec![dyn_t], void_t);
+    let d = new_reg(code, fp, dyn_t);
+    let v = new_reg(code, fp, void_t);
+    let rets = inject::ret_indices(&code.functions[fp]);
+    let ins = rets
+        .into_iter()
+        .map(|i| (i, vec![Opcode::UnsafeCast { dst: d, src: Reg(0) }, Opcode::Call1 { dst: v, fun: nat, arg0: d }]))
+        .collect();
+    inject::insert_ops(&mut code.functions[fp], ins);
+}
+
+/// Match render size before the map loads: at the start of map.LoadMap.start call
+/// xr_loading(), so the engine resizes to the eye size while the loading screen is up,
+/// before the match's renderer objects exist (a resize later breaks the building preview).
+fn patch_loading(code: &mut Bytecode) {
+    let void_t = type_index(code, &Type::Void);
+    let fp = find_method(code, "map.LoadMap", "start");
+    let nat = add_native(code, &xr_lib(), "xr_loading", vec![], void_t);
+    let v = new_reg(code, fp, void_t);
+    inject::insert_ops(&mut code.functions[fp], vec![(0, vec![Opcode::Call0 { dst: v, fun: nat }])]);
+}
+
+/// Game mode check: at the start of Game.onUpdate, xr_game(this).
+fn patch_game_hook(code: &mut Bytecode) {
+    let void_t = type_index(code, &Type::Void);
+    let dyn_t = type_index(code, &Type::Dyn);
+    let fp = find_method(code, "Game", "onUpdate");
+    let nat = add_native(code, &xr_lib(), "xr_game", vec![dyn_t], void_t);
+    let d = new_reg(code, fp, dyn_t);
+    let v = new_reg(code, fp, void_t);
+    inject::insert_ops(
+        &mut code.functions[fp],
+        vec![(0, vec![Opcode::UnsafeCast { dst: d, src: Reg(0) }, Opcode::Call1 { dst: v, fun: nat, arg0: d }])],
+    );
+}
+
+/// Clean VR exit: at the start of hxd.System.exit (the game's Quit), call
+/// xr_exiting() so the OpenXR session/instance are destroyed before the process ends.
+fn patch_exit(code: &mut Bytecode) {
+    let void_t = type_index(code, &Type::Void);
+    let fp = find_method(code, "hxd.$System", "exit");
+    let nat = add_native(code, &xr_lib(), "xr_exiting", vec![], void_t);
+    let v = new_reg(code, fp, void_t);
+    inject::insert_ops(&mut code.functions[fp], vec![(0, vec![Opcode::Call0 { dst: v, fun: nat }])]);
+}
+
 /// Index of a named field (inherited fields included) in an object type,
 /// as used by Field/SetField/GetThis.
 fn field_index(code: &Bytecode, tname: &str, fname: &str) -> (RefField, RefType) {
@@ -708,12 +776,35 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        Some("enumof") if args.len() == 5 => {
+            // hlpatch enumof <class> <field> <in.dat>: the enum type of a field and its constructors
+            let code = load(&args[4]);
+            for t in code.types.iter() {
+                if let Some(o) = t.get_type_obj() {
+                    if code.strings[o.name.0].as_str() != args[2] { continue; }
+                    for f in o.fields.iter() {
+                        if code.strings[f.name.0].as_str() != args[3] { continue; }
+                        let ft = &code.types[f.t.0];
+                        println!("{:?}", std::mem::discriminant(ft));
+                        if let hlbc::types::Type::Enum { name, constructs, .. } = ft {
+                            println!("enum {}", code.strings[name.0]);
+                            for (i, c) in constructs.iter().enumerate() { println!("  {} {}", i, code.strings[c.name.0]); }
+                        }
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
         Some("find") if args.len() == 4 => {
             let code = load(&args[3]);
             for f in code.functions.iter() {
                 let name = f.name(&code).to_string();
                 if name.contains(&args[2]) {
-                    println!("{}@{}", name, f.findex.0);
+                    let owner = f
+                        .parent
+                        .and_then(|t| code.types[t.0].get_type_obj().map(|o| code.strings[o.name.0].to_string()))
+                        .unwrap_or_default();
+                    println!("{}.{}@{}", owner, name, f.findex.0);
                 }
             }
             ExitCode::SUCCESS
@@ -731,10 +822,38 @@ fn main() -> ExitCode {
                 patch_rt(&mut code);
                 patch_ui_alpha(&mut code);
                 patch_ui_windows(&mut code);
+                patch_game_events(&mut code);
+                patch_weather(&mut code);
+                patch_loading(&mut code);
+                patch_exit(&mut code);
+                patch_game_hook(&mut code);
             }
             save(&code, &args[4]);
             let check = load(&args[4]); // verify the output parses again
             println!("OK: wrote {} (natives {} -> {})", args[4], before, check.natives.len());
+            ExitCode::SUCCESS
+        }
+        Some("field-writes") if args.len() == 5 => {
+            // hlpatch field-writes <TypeName> <field index> <in.dat>: SetField sites, with the op before
+            let code = load(&args[4]);
+            let fi: usize = args[3].parse().unwrap();
+            for f in code.functions.iter() {
+                for (i, op) in f.ops.iter().enumerate() {
+                    if let Opcode::SetField { obj, field, src } = op {
+                        if field.0 == fi && type_name(&code, f.regs[obj.0 as usize]).as_deref() == Some(args[2].as_str()) {
+                            let prev = if i > 0 { format!("{:?}", f.ops[i - 1]) } else { String::new() };
+                            println!("{}@{} op {i}: src reg{} ; prev {prev}", f.name(&code), f.findex.0, src.0);
+                        }
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Some("consts") if args.len() == 3 => {
+            // hlpatch consts <in.dat>: first 64 int and float constants
+            let code = load(&args[2]);
+            for (i, v) in code.ints.iter().enumerate().take(64) { println!("int {i}: {v}"); }
+            for (i, v) in code.floats.iter().enumerate().take(64) { println!("float {i}: {v}"); }
             ExitCode::SUCCESS
         }
         Some("rawops") if args.len() == 5 => {
@@ -807,6 +926,33 @@ fn main() -> ExitCode {
                 if hit {
                     let parent = f.parent.and_then(|p| type_name(&code, p)).unwrap_or_default();
                     println!("{}.{}@{}", parent, code.strings[f.name.0].as_str(), f.findex.0);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Some("sig") if args.len() == 4 => {
+            // Functions with a name containing <substr>: Parent.name@findex  type
+            let code = load(&args[3]);
+            for f in code.functions.iter() {
+                let name = code.strings[f.name.0].as_str();
+                if name.contains(&args[2]) {
+                    let parent = f.parent.and_then(|p| type_name(&code, p)).unwrap_or_default();
+                    println!("{}.{}@{}  {}", parent, name, f.findex.0, f.t.display::<hlbc::fmt::EnhancedFmt>(&code));
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Some("enum") if args.len() == 4 => {
+            // Constructors of an enum type: name(param types)
+            let code = load(&args[3]);
+            for t in code.types.iter() {
+                if let Type::Enum { name, constructs, .. } = t {
+                    if code.strings[name.0].as_str() == args[2] {
+                        for c in constructs {
+                            let ps: Vec<String> = c.params.iter().map(|p| p.display::<hlbc::fmt::EnhancedFmt>(&code).to_string()).collect();
+                            println!("{}({})", code.strings[c.name.0].as_str(), ps.join(", "));
+                        }
+                    }
                 }
             }
             ExitCode::SUCCESS
