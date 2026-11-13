@@ -66,8 +66,15 @@ for crate in "${RUST_CRATES[@]}"; do
         fi
     done
     if [[ "$copied" -eq 0 ]]; then
-        echo "No license file found for $crate" >&2
-        exit 1
+        # Some crates (flexstr) publish no license file, only an SPDX expression in Cargo.toml:
+        # record that, so the zip still says how the crate is licensed.
+        spdx="$(sed -n 's/^license *= *"\(.*\)"/\1/p' "$crate_src/Cargo.toml" | head -n1)"
+        if [[ -z "$spdx" ]]; then
+            echo "No license file or license field found for $crate" >&2
+            exit 1
+        fi
+        printf '%s is licensed under %s (SPDX expression from its Cargo.toml; the crate ships no license file).\n' \
+            "$crate" "$spdx" > "$crate_licenses/LICENSE-SPDX.txt"
     fi
 done
 
