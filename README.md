@@ -22,9 +22,28 @@ Released as-is. Tested: Quest 3 via Virtual Desktop. Other OpenXR headsets untes
 
 1. Extract the release zip.
 2. Run `NorthgardVR_Setup.exe` (unsigned: *More info → Run anyway*).
-3. Start your VR runtime, then the **Northgard VR** shortcut. Steam must be running.
+   It copies the mod into your Northgard game folder and adds a **Northgard VR** shortcut to
+   the desktop and Start menu.
 
-Steam's Play button still starts the normal game. Uninstall: `NorthgardVR_Setup.exe /uninstall`.
+## Play in VR
+
+1. Start Steam and your VR runtime (e.g. Virtual Desktop).
+2. Double-click the **Northgard VR** shortcut, or `NorthgardVR.exe` in the Northgard game folder.
+
+`NorthgardVR.exe` checks for a Northgard update (and re-prepares the VR version if there was
+one), then starts the game in VR.
+
+**Steam's Play button starts the normal desktop game.** To make it start VR instead, set
+Northgard's launch options in Steam (right-click Northgard → Properties → General → Launch
+options) to:
+
+```
+%command% vrboot.dat
+```
+
+Steam then skips the update check, so after a Northgard update run `NorthgardVR.exe` once.
+
+Uninstall: `NorthgardVR_Setup.exe /uninstall` (clear the Steam launch option if you set one).
 
 ## Controls
 

@@ -95,8 +95,19 @@ cp config/NorthgardVR_ui_layout.txt config/NorthgardVR_notify_rules.txt CHANGELO
 cat > "$OUT/README.txt" <<TXT
 NorthgardVR $VER - VR mod for Northgard (Steam)
 
-Install:   extract this zip anywhere, run NorthgardVR_Setup.exe.
-Play:      "Northgard VR" shortcut (desktop / Start menu). Steam's Play button stays the normal game.
+Install:   Extract this zip anywhere and run NorthgardVR_Setup.exe. It copies the mod into
+           your Northgard game folder and adds a "Northgard VR" shortcut to the desktop and
+           Start menu.
+
+Play VR:   Start Steam and your VR runtime, then double-click the "Northgard VR" shortcut
+           (or NorthgardVR.exe in the Northgard game folder). It checks for a game update,
+           re-prepares the VR version if needed, and starts the game in VR.
+
+Steam:     Steam's Play button starts the normal desktop game. To make it start VR, set
+           Northgard's launch options in Steam (Properties > General) to:
+               %command% vrboot.dat
+           Steam then skips the update check: after a Northgard update, run NorthgardVR.exe once.
+
 Uninstall: NorthgardVR_Setup.exe /uninstall  (your NorthgardVR settings are kept)
 Problems:  VR options (left stick click) > Log > Open folder, and send NorthgardVR_log.txt.
 TXT
