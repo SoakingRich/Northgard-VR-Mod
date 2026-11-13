@@ -31,6 +31,10 @@
 #include <share.h>
 #include <stdarg.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 // ---------------------------------------------------------------- logging
 static FILE *g_log;
 
@@ -241,8 +245,12 @@ HL_PRIM void HL_NAME(xr_loading)(void) {
     }
 }
 DEFINE_PRIM(_VOID, xr_loading, _NO_ARG);
+int xrt_game_error_open(void); // xr_theater.c
 static void rt_mode_tick(void) {
     static long long since;
+    // The game's error screen is up: keep the size. Resizing here sent the resize to the
+    // error screen, and after "Continue" the match kept drawing at the menu size.
+    if (xrt_game_error_open()) { since = g_frames; return; }
     int xrt_stereo_enabled(void);
     int live = xr_game_camera_live() && xrt_stereo_enabled(); // flat mode (Ranked): the menu size, 16:9
     if (live) g_rt_seen_live = 1;
@@ -451,10 +459,22 @@ static void reset_view(void) {
 }
 
 // ------------------------------------------------------------ pointer
-// While a finger rests on the right trigger, the right controller's aim ray
+// While a finger rests on the pointer trigger, that controller's aim ray
 // drives the game's picking. The game's mouse is held at the window centre via
 // posted mouse messages (buttons: see pointer_frame).
 static int g_ptr_lbtn, g_ptr_rbtn, g_ptr_logged;
+enum { PTR_SOURCE_NONE, PTR_SOURCE_PRIMARY, PTR_SOURCE_TRIGGER };
+enum { PTR_RIGHT_NONE, PTR_RIGHT_NATURAL, PTR_RIGHT_TALLY };
+typedef struct {
+    int frames, lpend, rpend;
+    int lpend_modifier, lpend_source;
+    int active_left_source, wait_left_neutral;
+    int trigger_held, trigger_button, cancel_button;
+    int modifier_held, right_owner;
+    int shift_down, escape_down, block_until_neutral;
+    HWND shift_hwnd, escape_hwnd;
+} pointer_state;
+static pointer_state g_pointer;
 
 static BOOL CALLBACK find_game_window(HWND w, LPARAM out) {
     DWORD pid = 0;
@@ -471,10 +491,63 @@ static int g_mouse_set, g_mouse_x, g_mouse_y; // pointer position in client px
 static double g_ptr_last_use = -10;            // QPC seconds when the VR pointer was last used
 static LARGE_INTEGER g_freq;                    // (defined with the frame timer below)
 static int g_dragging;                           // left/right button held and moved past the click slop
+static int g_drag_z_set;                         // drag plane pinned to its starting terrain height
 static float g_press_hit[3], g_cur_hit[3];       // table-plane hits (play space) at press / now
 static int g_press_hit_ok, g_cur_hit_ok;
 // Where the laser meets the table plane (play space), when it's on the map and not on a panel.
 int xr_cur_hit(float p[3]) { if (!g_cur_hit_ok || !g_ptr_active) return 0; memcpy(p, g_cur_hit, 3 * sizeof(float)); return 1; }
+
+// Northgard's additive-selection hotkey is Shift. Keep it down for the whole
+// synthetic mouse gesture (including mouse-up), rather than mirroring the raw
+// off-hand trigger: releasing the trigger before A must not change a gesture
+// which already started as additive.
+static void post_shift(int down) {
+    if (down == g_pointer.shift_down) return;
+    if (down) {
+        if (!g_game_hwnd || !IsWindow(g_game_hwnd)) {
+            g_game_hwnd = NULL;
+            EnumWindows(find_game_window, (LPARAM)&g_game_hwnd);
+        }
+        if (!g_game_hwnd) return;
+        g_pointer.shift_hwnd = g_game_hwnd;
+        LPARAM sc = ((LPARAM)MapVirtualKeyA(VK_SHIFT, 0) << 16) | 1;
+        PostMessageA(g_pointer.shift_hwnd, WM_KEYDOWN, VK_SHIFT, sc);
+        g_pointer.shift_down = 1;
+        logf_("selection modifier: Shift down");
+    } else {
+        HWND w = g_pointer.shift_hwnd;
+        if (w && IsWindow(w)) {
+            LPARAM sc = ((LPARAM)MapVirtualKeyA(VK_SHIFT, 0) << 16) | 1;
+            PostMessageA(w, WM_KEYUP, VK_SHIFT, sc | (1u << 30) | (1u << 31));
+        }
+        g_pointer.shift_down = 0;
+        g_pointer.shift_hwnd = NULL;
+        logf_("selection modifier: Shift up");
+    }
+}
+
+static void post_escape(int down) {
+    if (down == g_pointer.escape_down) return;
+    LPARAM sc = ((LPARAM)MapVirtualKeyA(VK_ESCAPE, 0) << 16) | 1;
+    if (down) {
+        if (!g_game_hwnd || !IsWindow(g_game_hwnd)) {
+            g_game_hwnd = NULL;
+            EnumWindows(find_game_window, (LPARAM)&g_game_hwnd);
+        }
+        if (!g_game_hwnd) return;
+        g_pointer.escape_hwnd = g_game_hwnd;
+        PostMessageA(g_pointer.escape_hwnd, WM_KEYDOWN, VK_ESCAPE, sc);
+        g_pointer.escape_down = 1;
+        logf_("escape (controller)");
+    } else {
+        HWND w = g_pointer.escape_hwnd;
+        if (w && IsWindow(w))
+            PostMessageA(w, WM_KEYUP, VK_ESCAPE, sc | (1u << 30) | (1u << 31));
+        g_pointer.escape_down = 0;
+        g_pointer.escape_hwnd = NULL;
+    }
+}
+
 static void post_mouse(UINT msg) {
     if (!g_game_hwnd || !IsWindow(g_game_hwnd)) {
         g_game_hwnd = NULL;
@@ -507,8 +580,37 @@ static void post_mouse(UINT msg) {
     last_x = x;
     last_y = y;
     LPARAM pos = MAKELPARAM(x, y);
-    WPARAM keys = (g_ptr_lbtn ? MK_LBUTTON : 0) | (g_ptr_rbtn ? MK_RBUTTON : 0);
+    WPARAM keys = (g_ptr_lbtn ? MK_LBUTTON : 0) | (g_ptr_rbtn ? MK_RBUTTON : 0) |
+                  (g_pointer.shift_down ? MK_SHIFT : 0);
     PostMessageA(g_game_hwnd, msg, keys, pos);
+}
+
+// Lifecycle paths outside pointer_frame (session focus/render loss and shutdown)
+// call this too. Mouse-up must precede Shift-up or the game can retain an
+// additive selection latch. Blocking until neutral also prevents a held button
+// from becoming a fresh click when tracking/focus returns.
+void xr_pointer_cancel(const char *reason, int block_until_neutral) {
+    int had_input = g_ptr_lbtn || g_ptr_rbtn || g_pointer.lpend || g_pointer.rpend ||
+                    g_pointer.shift_down || g_pointer.escape_down || g_pointer.trigger_button ||
+                    g_pointer.cancel_button || g_pointer.right_owner;
+    if (g_ptr_lbtn) { g_ptr_lbtn = 0; post_mouse(WM_LBUTTONUP); }
+    if (g_ptr_rbtn) { g_ptr_rbtn = 0; post_mouse(WM_RBUTTONUP); }
+    post_escape(0);
+    post_shift(0);
+    g_pointer.frames = g_pointer.lpend = g_pointer.rpend = 0;
+    g_pointer.lpend_modifier = 0;
+    g_pointer.lpend_source = PTR_SOURCE_NONE;
+    g_pointer.active_left_source = PTR_SOURCE_NONE;
+    g_pointer.wait_left_neutral = 0;
+    g_pointer.trigger_held = g_pointer.trigger_button = g_pointer.cancel_button = 0;
+    g_pointer.modifier_held = 0;
+    g_pointer.right_owner = PTR_RIGHT_NONE;
+    if (block_until_neutral) g_pointer.block_until_neutral = 1;
+    g_ptr_active = 0;
+    g_dragging = g_drag_z_set = 0;
+    g_press_hit_ok = g_cur_hit_ok = 0;
+    if (had_input) logf_("pointer cancelled (%s): mouse up, then Shift up%s",
+                         reason ? reason : "lifecycle", block_until_neutral ? "; waiting for neutral" : "");
 }
 
 static void log_pointer_hit(const char *what);
@@ -569,7 +671,7 @@ void xr_window_mirror(int rec_w, int rec_h) {
 }
 
 // True if the OS cursor is over the game window's client area.
-__attribute__((unused)) static int cursor_over_game(void) {
+static int cursor_over_game(void) {
     if (!g_game_hwnd) return 0;
     POINT sp, cp;
     RECT r;
@@ -587,8 +689,8 @@ static d3 g_ptr_wpos, g_ptr_wfwd, g_ptr_ground;
 int xrw_terrain_z(double x, double y, double *z); // xr_uiwin.c
 int xrw_sel_mode(void);                           // xr_uiwin.c: 0 none, 1 placing a building, 2 units, 3 other
 static double g_ground_z, g_drag_z;               // terrain under the laser / drag box height (game units)
-static int g_ground_z_ok, g_drag_z_set;
-static int g_on_panel;
+static int g_ground_z_ok;
+static int g_on_panel, g_on_tally;
 // Where the laser meets the drag plane (play space): the table plane, or while
 // dragging a box the plane at the ground height where the drag started.
 static void ray_drag_plane(void) {
@@ -653,7 +755,9 @@ static int aim_mouse(void) {
 static int panel_mouse(void) {
     d3 dir = quat_rot(g_ptr_quat, (d3){0, 0, -1});
     float d[3] = {(float)dir.x, (float)dir.y, (float)dir.z}, ux, uy, dist;
-    int hit = xrt_panel_hit(g_ptr_pos, d, &ux, &uy, &dist);
+    int tally = 0;
+    int hit = xrt_panel_hit(g_ptr_pos, d, &ux, &uy, &dist, &tally);
+    g_on_tally = hit && tally;
     if (hit != g_on_panel) {
         g_on_panel = hit;
         logf_("pointer %s HUD panel", hit ? "on" : "off");
@@ -671,15 +775,16 @@ static int panel_mouse(void) {
     return 1;
 }
 
-// Right-hand pointer. Trigger touch (or a partial pull) aims; A selects, the
-// trigger clicks or gives orders, B cancels a placement. Presses are latched and only sent once the
+// Logical pointer hand (right by default, mirrored in left-handed mode). Trigger
+// touch aims; the lower face button selects, trigger clicks or gives orders, and
+// the upper face button cancels placement. Presses are latched and only sent once the
 // pointer has been aiming for a few frames, so the game has hovered along the
 // controller ray first (a quick tap from rest would otherwise click wherever
 // the desktop view pointed).
 #define PTR_SETTLE_FRAMES 3
 static void exe_dir_file(const char *name, char *out, size_t n);
 static void pointer_frame(const xr_input *in) {
-    static int frames, lpend, rpend;
+    g_pointer.modifier_held = in->trigger[0] > (g_pointer.modifier_held ? 0.4f : 0.6f);
     { // The laser maps onto the game window's client area: a minimised window has
       // none, so restore it (without taking focus) while VR runs.
         static unsigned k;
@@ -733,6 +838,18 @@ static void pointer_frame(const xr_input *in) {
             return;
         }
     }
+    if (g_pointer.block_until_neutral) {
+        // Debug-file clicks above are deliberately independent of controller
+        // tracking. Real controller injection, however, can resume only after
+        // a focused frame proves that the live controls are actually neutral.
+        int neutral = xrt_input_focused() && in->aim_valid[1] &&
+                      !in->btn_lower[0] && !in->btn_lower[1] && !in->btn_upper[1] &&
+                      !in->menu[0] && !in->stick_click[0] && !in->stick_click[1] &&
+                      in->trigger[0] < 0.4f && in->trigger[1] < 0.4f;
+        if (!neutral) { g_ptr_active = 0; return; }
+        g_pointer.block_until_neutral = 0;
+        g_pointer.modifier_held = 0;
+    }
     { // Match <-> menus switch: leave the game's mouse alone for a moment. Mouse
       // messages from the laser while the match was being torn down (title screen
       // built at the match's render size) made the game report an error.
@@ -742,55 +859,58 @@ static void pointer_frame(const xr_input *in) {
         int live = xr_game_camera_live() && xrt_stereo_enabled(); // same rule as the render size
         if (live != last_live) { if (last_live >= 0) { changed_at = g_frames; logf_("pointer: paused for the %s switch", live ? "menus -> match" : "match -> menus"); } last_live = live; }
         if (g_frames - changed_at < 120 || g_rt_match != live) {
-            if (g_ptr_lbtn) { g_ptr_lbtn = 0; post_mouse(WM_LBUTTONUP); }
-            if (g_ptr_rbtn) { g_ptr_rbtn = 0; post_mouse(WM_RBUTTONUP); }
-            g_ptr_active = 0;
-            frames = lpend = rpend = 0;
+            xr_pointer_cancel("match/menu transition", 1);
             return;
         }
     }
-    if (xrt_options_input(in)) { // VR options menu (left stick click) took the laser this frame
-        g_ptr_active = 0;
+    int overlay_input = xrt_options_input(in);
+    if (overlay_input) { // VR options menu / notification owns the laser this frame
+        // The open menu is modal but must keep receiving its own trigger input.
+        // A closing/dismiss click returns 2 so game input stays gated until all
+        // involved controls are neutral.
+        xr_pointer_cancel("VR menu or notification", overlay_input == 2);
         return;
     }
-    { // Escape (close Lore and other windows, cancel a building): left menu button or right stick click
-        static int prev_esc;
-        int esc = in->menu[0] || in->stick_click[1];
+    { // Escape (close Lore and other windows, cancel a building): left X/menu or right stick click
+        int esc = in->btn_lower[0] || in->menu[0] || in->stick_click[1];
         // down and up go out on different frames: the game's key polling misses a
         // press whose down and up arrive within one frame
-        LPARAM sc = (LPARAM)MapVirtualKeyA(VK_ESCAPE, 0) << 16;
-        if (esc && !prev_esc && g_game_hwnd) {
-            PostMessageA(g_game_hwnd, WM_KEYDOWN, VK_ESCAPE, sc | 1);
-            logf_("escape (controller)");
-            xrt_haptic(in->menu[0] ? 0 : 1, 0.3f, 20);
+        if (esc && !g_pointer.escape_down) {
+            post_escape(1);
+            xrt_haptic(in->btn_lower[0] || in->menu[0] ? 0 : 1, 0.3f, 20);
         }
-        if (!esc && prev_esc && g_game_hwnd)
-            PostMessageA(g_game_hwnd, WM_KEYUP, VK_ESCAPE, sc | 1 | (1u << 30) | (1u << 31));
-        prev_esc = esc;
+        if (!esc && g_pointer.escape_down) post_escape(0);
     }
-    // Buttons (right hand):
-    //   A       = left button: select, drag a selection box, place a building
+    // Buttons (logical pointer hand):
+    //   A / X   = left button: select, drag a selection box, place a building
     //   trigger = orders: right click while units are selected (on the map);
     //             otherwise a left click (buildings, HUD panels, menus, placing)
     //   B       = cancel: right click while placing a building
     // Which button the trigger / B sends is decided when pressed and kept until released.
-    static int trig_held, trig_btn, b_btn; // trig_btn / b_btn: 0 none, 1 left, 2 right
-    int trig = in->trigger[1] > (trig_held ? 0.4f : 0.6f);
+    int trig = in->trigger[1] > (g_pointer.trigger_held ? 0.4f : 0.6f);
     int sel = xrw_sel_mode();
-    if (trig && !trig_held) {
+    if (trig && !g_pointer.trigger_held) {
         // A down too: A wins (the simulator also pulls the trigger with A)
-        trig_btn = in->btn_lower[1] ? 0 : (sel == 2 && overview_on() && !g_on_panel) ? 2 : 1;
-        logf_("trigger -> %s (selection: %d, on panel %d)", trig_btn == 2 ? "right click" : trig_btn ? "left click" : "nothing, A is down", sel, g_on_panel);
+        g_pointer.trigger_button = in->btn_lower[1] ? 0 : (sel == 2 && overview_on() && !g_on_panel) ? 2 : 1;
+        logf_("trigger -> %s (selection: %d, on panel %d)", g_pointer.trigger_button == 2 ? "right click" : g_pointer.trigger_button ? "left click" : "nothing, A is down", sel, g_on_panel);
     }
-    trig_held = trig;
-    if (!trig) trig_btn = 0;
+    g_pointer.trigger_held = trig;
+    if (!trig) g_pointer.trigger_button = 0;
     int bdown = in->btn_upper[1];
-    if (bdown && !b_btn) b_btn = sel == 1 ? 2 : 3; // 3: pressed, nothing to cancel
-    if (!bdown) b_btn = 0;
-    int want_l = in->btn_lower[1] || trig_btn == 1;
-    int want_r = trig_btn == 2 || b_btn == 2;
-    if (want_l && !g_ptr_lbtn) lpend = 1;
-    if (want_r && !g_ptr_rbtn) rpend = 1;
+    if (bdown && !g_pointer.cancel_button) g_pointer.cancel_button = sel == 1 ? 2 : 3; // 3: pressed, nothing to cancel
+    if (!bdown) g_pointer.cancel_button = 0;
+    int want_l = in->btn_lower[1] || g_pointer.trigger_button == 1;
+    int want_r = g_pointer.trigger_button == 2 || g_pointer.cancel_button == 2;
+    if (!want_l) g_pointer.wait_left_neutral = 0;
+    if (want_l && !g_ptr_lbtn && g_pointer.right_owner != PTR_RIGHT_TALLY &&
+        !g_pointer.lpend && !g_pointer.active_left_source && !g_pointer.wait_left_neutral) {
+        g_pointer.lpend = 1;
+        g_pointer.lpend_modifier = g_pointer.modifier_held;
+        g_pointer.lpend_source = in->btn_lower[1] ? PTR_SOURCE_PRIMARY : PTR_SOURCE_TRIGGER;
+        if (g_pointer.lpend_modifier)
+            logf_("selection modifier latched (%s)", g_pointer.lpend_source == PTR_SOURCE_PRIMARY ? "primary button" : "pointer trigger");
+    }
+    if (want_r && !g_ptr_rbtn && g_pointer.right_owner == PTR_RIGHT_NONE) g_pointer.rpend = 1;
     // The laser drives the game's mouse whenever the right controller is
     // tracked (hover and tooltips need no trigger touch). Moving the real
     // mouse hands it back to the desktop until the controller moves again.
@@ -811,7 +931,7 @@ static void pointer_frame(const xr_input *in) {
         memcpy(last_aim, in->aim_quat[1], sizeof(last_aim));
         if (now0 - real_mouse_t < 3.0) real_mouse_t = -10;
     }
-    int raw = in->aim_valid[1] && (now0 - real_mouse_t > 3.0 || lpend || rpend || g_ptr_lbtn || g_ptr_rbtn);
+    int raw = in->aim_valid[1] && (now0 - real_mouse_t > 3.0 || g_pointer.lpend || g_pointer.rpend || g_ptr_lbtn || g_ptr_rbtn);
     // The Quest's trigger-touch sensor flickers while a finger rests on it:
     // keep the pointer on for 0.5 s after the last touch, or the game's mouse
     // jumps away and back (hover sounds re-trigger, the build preview drops).
@@ -822,6 +942,7 @@ static void pointer_frame(const xr_input *in) {
     if (raw) last_raw = now;
     g_ptr_last_use = last_raw;
     int active = in->aim_valid[1] && (raw || now - last_raw < 0.5);
+    int was_active = g_ptr_active;
     if (active) {
         memcpy(g_ptr_pos, in->aim_pos[1], sizeof(g_ptr_pos));
         memcpy(g_ptr_quat, in->aim_quat[1], sizeof(g_ptr_quat));
@@ -830,15 +951,16 @@ static void pointer_frame(const xr_input *in) {
     if (active != g_ptr_active) logf_("pointer %s", active ? "on" : "off");
     g_ptr_active = active;
     if (!active) {
-        frames = lpend = rpend = 0;
-        if (g_ptr_lbtn) { g_ptr_lbtn = 0; post_mouse(WM_LBUTTONUP); }
-        if (g_ptr_rbtn) { g_ptr_rbtn = 0; post_mouse(WM_RBUTTONUP); }
-        g_drag_z_set = 0;
+        if (was_active || g_ptr_lbtn || g_ptr_rbtn || g_pointer.lpend || g_pointer.rpend ||
+            g_pointer.shift_down || g_pointer.trigger_button || g_pointer.cancel_button)
+            xr_pointer_cancel("tracking or pointer loss", 1);
+        else
+            g_pointer.frames = 0;
         // Leave the game's mouse where the laser last was (jumping to the
         // centre re-triggers hover effects).
         return;
     }
-    frames++;
+    g_pointer.frames++;
     g_mouse_set = panel_mouse() || (overview_on() && aim_mouse());
     if (!g_mouse_set && overview_on() && g_game_hwnd) {
         // laser on nothing (sky, beyond the map): park the game's mouse over the
@@ -851,11 +973,15 @@ static void pointer_frame(const xr_input *in) {
     }
     ray_drag_plane();
     post_mouse(WM_MOUSEMOVE);
-    if (frames < PTR_SETTLE_FRAMES) return;
+    if (g_pointer.frames < PTR_SETTLE_FRAMES) return;
     // Down on the first settled frame after a press; up on a later frame once
     // the button is released (so even a one-frame tap is a full click).
-    if (lpend && !g_ptr_lbtn) {
-        lpend = 0;
+    int tally_down = 0;
+    int left_source_down =
+        g_pointer.active_left_source == PTR_SOURCE_PRIMARY ? in->btn_lower[1] :
+        g_pointer.active_left_source == PTR_SOURCE_TRIGGER ? g_pointer.trigger_button == 1 : 0;
+    if (g_pointer.lpend && !g_ptr_lbtn && g_pointer.right_owner != PTR_RIGHT_TALLY) {
+        g_pointer.lpend = 0;
         // The selection box lies at the ground height where it starts (the
         // terrain is uneven): from now until release the laser meets that plane.
         g_drag_z_set = 0;
@@ -866,11 +992,70 @@ static void pointer_frame(const xr_input *in) {
             if (g_mouse_set && !g_on_panel) aim_mouse();
         }
         memcpy(g_press_hit, g_cur_hit, sizeof(g_press_hit)); g_press_hit_ok = g_cur_hit_ok;
-        g_ptr_lbtn = 1; post_mouse(WM_LBUTTONDOWN); log_pointer_hit("left click"); xrt_haptic(1, 0.35f, 25);
+        int modified = g_pointer.lpend_modifier &&
+                       ((g_pointer.lpend_source == PTR_SOURCE_PRIMARY && overview_on() && !g_on_panel) || g_on_tally);
+        int wants_tally = modified && g_on_tally;
+        if (wants_tally && (g_ptr_rbtn || g_pointer.rpend || g_pointer.right_owner != PTR_RIGHT_NONE)) {
+            // First edge/owner wins. Do not turn a conflicting modified tally
+            // gesture into both a plain left click and the pending natural
+            // right click; consume it until its initiating control is neutral.
+            logf_("unit tally modifier dropped: right button already owned");
+            g_pointer.wait_left_neutral = want_l;
+            g_pointer.lpend_modifier = 0;
+            g_pointer.lpend_source = PTR_SOURCE_NONE;
+        } else {
+            if (modified) {
+                post_shift(1);
+                modified = g_pointer.shift_down; // never turn a tally click into plain right-click
+            }
+            if (modified && g_on_tally) {
+                g_pointer.right_owner = PTR_RIGHT_TALLY;
+                tally_down = 1;
+                g_ptr_rbtn = 1;
+                post_mouse(WM_RBUTTONDOWN);
+                log_pointer_hit("unit tally Shift+right click");
+                logf_("unit tally modifier -> Shift+right click");
+            } else {
+                g_ptr_lbtn = 1;
+                post_mouse(WM_LBUTTONDOWN);
+                log_pointer_hit(modified ? "Shift+left click" : "left click");
+            }
+            g_pointer.active_left_source = g_pointer.lpend_source;
+            xrt_haptic(1, modified && g_on_tally ? 0.6f : 0.35f, modified && g_on_tally ? 45 : 25);
+            g_pointer.lpend_modifier = 0;
+            g_pointer.lpend_source = PTR_SOURCE_NONE;
+        }
     }
-    else if (g_ptr_lbtn && !want_l) { g_ptr_lbtn = 0; post_mouse(WM_LBUTTONUP); g_drag_z_set = 0; }
-    if (rpend && !g_ptr_rbtn) { rpend = 0; g_ptr_rbtn = 1; post_mouse(WM_RBUTTONDOWN); log_pointer_hit("right click"); xrt_haptic(1, 0.6f, 45); }
-    else if (g_ptr_rbtn && !want_r) { g_ptr_rbtn = 0; post_mouse(WM_RBUTTONUP); }
+    else if (g_ptr_lbtn && !left_source_down) {
+        g_ptr_lbtn = 0;
+        post_mouse(WM_LBUTTONUP);
+        post_shift(0);
+        g_pointer.active_left_source = PTR_SOURCE_NONE;
+        g_pointer.wait_left_neutral = want_l;
+        g_drag_z_set = 0;
+    }
+    if (g_pointer.right_owner == PTR_RIGHT_TALLY) {
+        if (!left_source_down && !tally_down) {
+            g_ptr_rbtn = 0;
+            post_mouse(WM_RBUTTONUP);
+            post_shift(0);
+            g_pointer.right_owner = PTR_RIGHT_NONE;
+            g_pointer.active_left_source = PTR_SOURCE_NONE;
+            g_pointer.wait_left_neutral = want_l;
+            g_drag_z_set = 0;
+        }
+    } else if (g_pointer.rpend && !g_ptr_rbtn) {
+        g_pointer.rpend = 0;
+        g_pointer.right_owner = PTR_RIGHT_NATURAL;
+        g_ptr_rbtn = 1;
+        post_mouse(WM_RBUTTONDOWN);
+        log_pointer_hit("right click");
+        xrt_haptic(1, 0.6f, 45);
+    } else if (g_pointer.right_owner == PTR_RIGHT_NATURAL && g_ptr_rbtn && !want_r) {
+        g_ptr_rbtn = 0;
+        post_mouse(WM_RBUTTONUP);
+        g_pointer.right_owner = PTR_RIGHT_NONE;
+    }
 }
 
 // Menus (theater screen): same pointer as in a match, hitting only the screen.
@@ -892,6 +1077,65 @@ int dio_table_info(float out[5]) {
     return 1;
 }
 
+// Panning the map in VR also moves the game's own camera there, so what follows it
+// (the weather fog that clears around where you look, sound, ...) follows the map. Once
+// the camera is still, the game is asked to look at the point under the table centre
+// (cam.CameraController.move, hooked by hlpatch); while it glides there the pan offset
+// shrinks by the same amount (in xr_cam_compute), so the view itself doesn't move.
+static int g_rc_need, g_rc_pending, g_rc_active, g_rc_frames, g_rc_moved, g_rc_still;
+static double g_rc_req[2], g_rc_prev[3], g_rc_ct[2];
+HL_PRIM bool HL_NAME(xr_cam_ctl)(double x, double y) {
+    g_rc_ct[0] = x; g_rc_ct[1] = y;
+    if (!g_rc_pending) return false;
+    g_rc_pending = 0;
+    return true;
+}
+HL_PRIM double HL_NAME(xr_cam_ctl_x)(void) { return g_rc_req[0]; }
+HL_PRIM double HL_NAME(xr_cam_ctl_y)(void) { return g_rc_req[1]; }
+static void recentre_track(double tx, double ty, double tz) { // from xr_cam_compute
+    if (!g_rc_active) return;
+    double dx = tx - g_rc_prev[0], dy = ty - g_rc_prev[1], dz = tz - g_rc_prev[2];
+    if (dx == 0 && dy == 0 && dz == 0) return;
+    double before = hypot(g_rc_req[0] - g_rc_prev[0], g_rc_req[1] - g_rc_prev[1]);
+    double after = hypot(g_rc_req[0] - tx, g_rc_req[1] - ty);
+    g_rc_prev[0] = tx; g_rc_prev[1] = ty; g_rc_prev[2] = tz;
+    if (after > before + 0.5) { // something else moved the camera (minimap, alert...): it wins
+        logf_("diorama: camera sent elsewhere while following the map; pan offset cleared");
+        g_rc_active = 0;
+        dio_off[0] = dio_off[1] = dio_off[2] = 0;
+        return;
+    }
+    dio_off[0] -= dx; dio_off[1] -= dy; dio_off[2] -= dz;
+    g_rc_moved = 1;
+}
+static void recentre_frame(void) { // from dio_frame
+    static double last[3];
+    double T[3] = {g_last_tgt.x, g_last_tgt.y, g_last_tgt.z};
+    int moving = fabs(T[0] - last[0]) + fabs(T[1] - last[1]) > 0.01;
+    memcpy(last, T, sizeof(last));
+    g_rc_still = moving ? 0 : g_rc_still + 1;
+    if (g_rc_active) {
+        g_rc_frames++;
+        if ((g_rc_moved && g_rc_still >= 10) || (!g_rc_moved && g_rc_frames > 45) || g_rc_frames > 600) {
+            logf_("diorama: game camera now at (%.1f %.1f), pan offset left (%.1f %.1f)", T[0], T[1], dio_off[0], dio_off[1]);
+            g_rc_active = 0;
+        }
+        return;
+    }
+    if (!g_rc_need || g_rc_still < 5 || !xr_game_camera_live()) return;
+    if (hypot(dio_off[0], dio_off[1]) < 0.5) { g_rc_need = 0; return; }
+    g_rc_req[0] = T[0] + dio_off[0];
+    g_rc_req[1] = T[1] + dio_off[1];
+    memcpy(g_rc_prev, T, sizeof(T));
+    g_rc_need = 0;
+    g_rc_pending = 1;
+    g_rc_active = 1;
+    g_rc_frames = 0;
+    g_rc_moved = 0;
+    logf_("diorama: moving the game camera (%.1f %.1f) -> (%.1f %.1f) to follow the map (its target was %.1f %.1f)",
+          T[0], T[1], g_rc_req[0], g_rc_req[1], g_rc_ct[0], g_rc_ct[1]);
+}
+
 // Once per stereo frame, before the eyes are rendered.
 void dio_frame(const xr_input *in, const float head[3], const float hq[4], double dt) {
     if (!dio_placed) place_table(head, hq, in->floor_space);
@@ -905,7 +1149,7 @@ void dio_frame(const xr_input *in, const float head[3], const float hq[4], doubl
         static int have, still;
         double dx = g_last_tgt.x - last_t.x, dy = g_last_tgt.y - last_t.y;
         int moved = have && dx * dx + dy * dy > 0.01 * 0.01;
-        if (moved && still >= 10 && (dio_off[0] != 0 || dio_off[1] != 0)) {
+        if (moved && still >= 10 && !g_rc_active && (dio_off[0] != 0 || dio_off[1] != 0)) {
             logf_("diorama: game moved its camera (%.1f %.1f) -> (%.1f %.1f); pan offset (%.1f %.1f) cleared",
                   last_t.x, last_t.y, g_last_tgt.x, g_last_tgt.y, dio_off[0], dio_off[1]);
             dio_off[0] = dio_off[1] = dio_off[2] = 0;
@@ -914,6 +1158,7 @@ void dio_frame(const xr_input *in, const float head[3], const float hq[4], doubl
         last_t = g_last_tgt;
         have = 1;
     }
+    recentre_frame();
     prev_upper[0] = in->btn_upper[0];
     prev_upper[1] = in->btn_upper[1];
     { // view direction for the overview's screen axes
@@ -953,6 +1198,7 @@ void dio_frame(const xr_input *in, const float head[3], const float hq[4], doubl
             S *= l0 / l1;
             dio_theta += atan2(-v1z, v1x) - atan2(-v0z, v0x);
             C = d3_add(W, d3_scale(dio_M(m1), -S));
+            g_rc_need = 1;
         }
         // height: the table follows the hands' average vertical movement
         tab_pos[1] += ((in->hand_pos[0][1] - prev_hand[0][1]) + (in->hand_pos[1][1] - prev_hand[1][1])) * 0.5;
@@ -963,6 +1209,7 @@ void dio_frame(const xr_input *in, const float head[3], const float hq[4], doubl
                 p0.y = 0;
                 d3 dh = {hl[h].x - p0.x, 0, hl[h].z - p0.z};
                 C = d3_add(C, d3_scale(dio_M(dh), -S));
+                if (dh.x != 0 || dh.z != 0) g_rc_need = 1;
                 tab_pos[1] += in->hand_pos[h][1] - prev_hand[h][1]; // and up/down: the table follows the hand
             }
         }
@@ -1152,6 +1399,7 @@ HL_PRIM void HL_NAME(xr_cam_compute)(double a0, double a1, double a2, double a3,
     memcpy(g_cam_out, in, sizeof(in));
     g_last_pos.x = a0; g_last_pos.y = a1; g_last_pos.z = a2;
     g_last_tgt.x = a3; g_last_tgt.y = a4; g_last_tgt.z = a5;
+    recentre_track(a3, a4, a5);
     if (a15 > 1 && a15 < 1e6) {
         g_eye_far = a15 * EYE_FAR_MUL;
         static double logged_far;
@@ -1569,13 +1817,21 @@ DEFINE_PRIM(_VOID, xr_ui_target, _ABSTRACT(dx_resource));
 
 // Phase 1: called with the game's back buffer right before every present.
 HL_PRIM void HL_NAME(xr_frame)(void *backbuffer) { xr_theater_frame(backbuffer); }
-HL_PRIM void HL_NAME(xr_ui_windows)(vdynamic *ui) { xr_ui_windows_impl(ui); }
+void xr_debug_throw_check(void); // xr_uiwin.c
+HL_PRIM void HL_NAME(xr_ui_windows)(vdynamic *ui) { xr_ui_windows_impl(ui); xr_debug_throw_check(); }
 void xr_game_impl(void *game); // xr_uiwin.c
-HL_PRIM void HL_NAME(xr_game)(vdynamic *g) { g_game_frame = g_frames; xr_game_impl(g); }
+void xr_debug_throw_check(void); // xr_uiwin.c
+void xr_game_error_impl(void *env); // xr_uiwin.c
+HL_PRIM void HL_NAME(xr_game)(vdynamic *g) { g_game_frame = g_frames; xr_game_impl(g); xr_debug_throw_check(); }
+HL_PRIM void HL_NAME(xr_game_error)(vdynamic *env) { xr_game_error_impl(env); }
+void xrt_game_error_end(void); // xr_theater.c
+HL_PRIM void HL_NAME(xr_game_error_end)(void) { xrt_game_error_end(); }
 DEFINE_PRIM(_VOID, xr_game, _DYN);
 DEFINE_PRIM(_VOID, xr_ui_windows, _DYN);
 HL_PRIM void HL_NAME(xr_game_event)(vdynamic *e) { xr_game_event_impl(e); }
 DEFINE_PRIM(_VOID, xr_game_event, _DYN);
+DEFINE_PRIM(_VOID, xr_game_error, _DYN);
+DEFINE_PRIM(_VOID, xr_game_error_end, _NO_ARG);
 // Patched in at the start of hxd.System.exit (Quit): end VR cleanly first.
 HL_PRIM void HL_NAME(xr_exiting)(void) { xrt_shutdown("game exit"); }
 DEFINE_PRIM(_VOID, xr_exiting, _NO_ARG);
@@ -1590,6 +1846,9 @@ DEFINE_PRIM(_VOID, xr_ping_2, _NO_ARG);
 DEFINE_PRIM(_VOID, xr_ping_3, _NO_ARG);
 DEFINE_PRIM(_BOOL, xr_cam_active, _NO_ARG);
 DEFINE_PRIM(_VOID, xr_mark_main, _NO_ARG);
+DEFINE_PRIM(_BOOL, xr_cam_ctl, _F64 _F64);
+DEFINE_PRIM(_F64, xr_cam_ctl_x, _NO_ARG);
+DEFINE_PRIM(_F64, xr_cam_ctl_y, _NO_ARG);
 DEFINE_PRIM(_VOID, xr_cam_compute, _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64 _F64);
 DEFINE_PRIM(_F64, xr_out_next, _NO_ARG);
 DEFINE_PRIM(_BOOL, xr_cam_restore, _NO_ARG);

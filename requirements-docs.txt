@@ -1,0 +1,2 @@
+# Local release-plan renderer. Keep pinned so every preview renders consistently.
+zensical==0.1.0

@@ -35,10 +35,15 @@ void xrt_set_panel_anchor(const float head[3], float yaw);
 void xr_window_mirror(int rec_w, int rec_h);
 int xrt_stereo_on(void);
 int xrt_rt_size(int *w, int *h);
-// VR options menu: returns 1 when it used the right controller this frame (the game gets no mouse).
+// VR overlays: 1 consumes this frame while remaining interactive; 2 also asks
+// the game pointer to wait for neutral after a close/dismiss action.
 int xrt_options_input(const xr_input *in);
 int xrt_running(void);
+int xrt_input_focused(void);
 int xrt_ui_capture(void);
 void xrt_ui_target(void *res);
-int xrt_panel_hit(const float o[3], const float d[3], float *ux, float *uy, float *dist);
+int xrt_panel_hit(const float o[3], const float d[3], float *ux, float *uy, float *dist, int *tally);
+// Release any mouse/keyboard state owned by the VR pointer. Temporary losses
+// block fresh injection until every controller input is neutral again.
+void xr_pointer_cancel(const char *reason, int block_until_neutral);
 void xrt_haptic(int hand, float amplitude, int ms);

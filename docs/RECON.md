@@ -368,11 +368,46 @@ replacing or proxying `directx.hdll`.
   the game process, so Steam counts it as part of the game. After the game exits or is
   killed, Steam waits until the simulator window is closed too. Close the simulator →
   Play is back.
-- Northgard has no box/drag selection; it selects by clicking, and double-click selects
-  all units with the same job. A drag test just selected the unit under the release
-  point. Click slop keeps double-clicks intact.
+- The 2026-10-31 simulator drag test selected only the unit under the release point;
+  click slop keeps double-clicks intact. Later bytecode recon found a box-selection
+  callback, so this is an observed input-path limitation rather than proof the game has
+  no box selection (see below).
 - The game window may open offset (the game restores its own windowed position). Menu
   clicks must use the window's actual position.
+
+## Additive selection + Unit Tallies (2026-11-05 recon)
+
+- `$Hotkeys.addUnit` is the game's semantic additive-selection action. Its default key
+  is keycode 16 (Shift), and `ent.Unit.onClick` calls `UI.addToCurrentSel` (or removes an
+  already selected unit) while it is down.
+- The selection-release callback created by `Game.initUnderInteractive` also checks
+  `addUnit` and appends the boxed units instead of replacing the selection. The callback
+  is present in bytecode, but the older simulator drag result above means its reachable
+  mouse path still needs a fresh runtime test.
+- `ui.win.units.AllUnits.unitBtnOnClick` has separate click paths:
+  - left click sorts/cycles the units of that tally, centres the camera and clicks one;
+  - right click builds a selectable group for the whole tally (including related unit
+    kinds) and selects it;
+  - right click while `addUnit` is down calls `UI.addToCurrentSel` with the tally's whole
+    unit array.
+- Therefore an off-hand-trigger modifier can reuse the existing additive map-selection
+  behavior. For the requested tally chord it must also translate the VR left click to a
+  right click while keeping `addUnit` active; Shift+left alone adds only the one cycled
+  unit.
+- **Implemented; partially verified in the Meta XR Simulator:** `read_input` already mirrors the
+  controllers, so logical `trigger[0]` is always the non-pointer trigger. A press is
+  sampled when a selection click starts and latched through mouse-up; it posts Shift only
+  to Northgard's window and includes `MK_SHIFT` in the mouse messages. A modified click
+  whose source panel and UI pixel both identify `ui.win.units.AllUnits` is translated to
+  right-click, reusing the game's add-all path. Pointer-trigger orders on the map are not
+  modified. One cleanup path releases mouse buttons before Shift on tracking/focus loss,
+  menu transitions, render pauses, window replacement and shutdown, then waits for the
+  controls to return neutral before accepting another click. Right- and left-handed tests
+  confirmed the Unit Tally add-all translation and clean Shift release; the right-handed
+  test also confirmed an unchanged pointer-trigger map order and mouse-before-Shift cleanup
+  when the VR menu interrupts a gesture. The primary map path held Shift through mouse-up,
+  but an individual unit add/remove result and additive drag-box result still need a targeted
+  simulator check.
 
 ## Closing the game without a shell (2026-10-31 21:49, openxr_21)
 

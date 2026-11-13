@@ -1,0 +1,204 @@
+:root > * {
+  --md-primary-fg-color: #173843;
+  --md-primary-fg-color--light: #2d5c67;
+  --md-primary-fg-color--dark: #0b222a;
+  --md-accent-fg-color: #008f95;
+  --ngvr-gold: #c28b2c;
+  --ngvr-cyan: #1a9ba3;
+  --ngvr-danger: #b6373f;
+  --ngvr-surface: color-mix(in srgb, var(--md-default-bg-color) 94%, #1a9ba3 6%);
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 198;
+  --md-primary-fg-color: #102a33;
+  --md-accent-fg-color: #55c9ce;
+  --ngvr-gold: #e8b85e;
+  --ngvr-cyan: #55c9ce;
+  --ngvr-danger: #ff7f87;
+  --ngvr-surface: color-mix(in srgb, var(--md-default-bg-color) 90%, #55c9ce 10%);
+}
+
+.md-grid {
+  max-width: 82rem;
+}
+
+.md-content__inner {
+  max-width: 82ch;
+  margin-inline: auto;
+  padding-bottom: 4rem;
+}
+
+.md-content h1 {
+  margin-bottom: 1rem;
+  font-weight: 750;
+  letter-spacing: -0.035em;
+}
+
+.md-content h2 {
+  margin-top: 3rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid color-mix(in srgb, var(--md-default-fg-color) 18%, transparent);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.md-content h3 {
+  color: var(--md-primary-fg-color);
+  font-weight: 700;
+}
+
+[data-md-color-scheme="slate"] .md-content h3 {
+  color: var(--ngvr-cyan);
+}
+
+.release-hero {
+  display: block;
+  width: 100%;
+  max-height: 25rem;
+  margin: 0 0 1.5rem;
+  object-fit: cover;
+  object-position: center 62%;
+  border: 1px solid color-mix(in srgb, var(--md-default-fg-color) 18%, transparent);
+  border-radius: 1rem;
+  box-shadow: 0 1.1rem 2.8rem color-mix(in srgb, #071a20 24%, transparent);
+}
+
+.release-summary,
+.release-alert,
+.release-note,
+.release-decision {
+  margin-block: 1.25rem;
+  padding: 1rem 1.2rem;
+  border: 0;
+  border-left: 0.3rem solid var(--ngvr-cyan);
+  border-radius: 0.25rem 0.8rem 0.8rem 0.25rem;
+  background: var(--ngvr-surface);
+  box-shadow: 0 0.3rem 1rem color-mix(in srgb, #071a20 8%, transparent);
+}
+
+.release-summary p,
+.release-alert p,
+.release-note p,
+.release-decision p {
+  margin: 0.2rem 0;
+}
+
+.release-alert {
+  border-left-color: var(--ngvr-danger);
+  background: color-mix(in srgb, var(--md-default-bg-color) 90%, var(--ngvr-danger) 10%);
+}
+
+.release-note {
+  border-left-color: var(--ngvr-gold);
+  background: color-mix(in srgb, var(--md-default-bg-color) 91%, var(--ngvr-gold) 9%);
+}
+
+.release-decision {
+  border: 1px solid color-mix(in srgb, var(--ngvr-gold) 65%, transparent);
+  border-left: 0.3rem solid var(--ngvr-gold);
+}
+
+.md-button {
+  margin: 0.2rem 0.35rem 0.2rem 0;
+  border-radius: 999px;
+}
+
+.md-typeset table:not([class]) {
+  display: table;
+  width: 100%;
+  border-radius: 0.65rem;
+  box-shadow: 0 0.3rem 1.2rem color-mix(in srgb, #071a20 7%, transparent);
+}
+
+.md-typeset table:not([class]) th {
+  background: color-mix(in srgb, var(--md-primary-fg-color) 92%, black 8%);
+  color: white;
+  font-weight: 700;
+}
+
+.md-typeset table:not([class]) tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--md-default-bg-color) 96%, var(--ngvr-cyan) 4%);
+}
+
+.md-typeset .task-list-item {
+  margin-block: 0.45rem;
+}
+
+.md-typeset .task-list-control .task-list-indicator::before {
+  border-radius: 0.25rem;
+}
+
+.md-typeset code {
+  border-radius: 0.3rem;
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible {
+  outline: 3px solid var(--ngvr-gold);
+  outline-offset: 3px;
+}
+
+@media (max-width: 44rem) {
+  .md-content__inner {
+    max-width: 100%;
+  }
+
+  .release-hero {
+    max-height: 18rem;
+    border-radius: 0.7rem;
+  }
+
+  .release-summary,
+  .release-alert,
+  .release-note,
+  .release-decision {
+    padding: 0.85rem 1rem;
+  }
+
+  .md-button {
+    display: block;
+    width: 100%;
+    margin: 0.45rem 0;
+    text-align: center;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+@media print {
+  .md-header,
+  .md-sidebar,
+  .md-footer,
+  .md-content__button,
+  .md-button {
+    display: none !important;
+  }
+
+  .md-content__inner {
+    max-width: none;
+  }
+
+  .release-hero {
+    max-height: 12rem;
+    box-shadow: none;
+  }
+
+  .release-summary,
+  .release-alert,
+  .release-note,
+  .release-decision,
+  .md-typeset table:not([class]) {
+    box-shadow: none;
+  }
+}

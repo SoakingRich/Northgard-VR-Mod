@@ -620,3 +620,46 @@ __declspec(dllexport) void xr_weather_impl(void *w) {
         *((unsigned char *)root + off) = want;
     }
 }
+
+// ------------------------------------------------------------ game errors
+// End of ui.ExceptionReportEnvironment's constructor (the game's "a problem occurred"
+// screen): write the exception text and stack to our log, so a report has the cause.
+void xrt_game_error(void); // xr_theater.c
+__declspec(dllexport) void xr_game_error_impl(void *env) {
+    if (!env || !api_init()) return;
+    static int h_msg, h_stack;
+    if (!h_msg) { h_msg = p_hash("message"); h_stack = p_hash("stack"); }
+    static char buf[8192];
+    hl_string(getp(env, h_msg, K_OBJ), buf, sizeof(buf));
+    logf_("GAME ERROR: %s", buf[0] ? buf : "(no message)");
+    hl_string(getp(env, h_stack, K_OBJ), buf, sizeof(buf));
+    for (char *line = buf, *next; line && *line; line = next) { // one log line per stack line
+        next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        if (*line && *line != '\r') logf_("GAME ERROR:   %s", line);
+    }
+    xrt_game_error();
+}
+
+// Debug tooling: NorthgardVR_throw.flag in the game folder makes the next Game.onUpdate
+// (or the next UI update, in menus) throw a test exception, to exercise the game's error
+// screen in VR.
+typedef void (*throw_fn)(void *);
+typedef void *(*strbytes_fn)(const unsigned short *, ...);
+void xr_debug_throw_check(void) {
+    if (!xrt_debug()) return;
+    static unsigned k;
+    if (++k % 30) return;
+    char f[MAX_PATH]; DWORD n = GetModuleFileNameA(NULL, f, MAX_PATH);
+    while (n > 0 && f[n - 1] != '\\') n--;
+    f[n] = 0; strcat_s(f, MAX_PATH, "NorthgardVR_throw.flag");
+    if (GetFileAttributesA(f) == INVALID_FILE_ATTRIBUTES) return;
+    DeleteFileA(f);
+    HMODULE m = GetModuleHandleA("libhl.dll");
+    throw_fn thr = m ? (throw_fn)GetProcAddress(m, "hl_throw") : NULL;
+    strbytes_fn sb = m ? (strbytes_fn)GetProcAddress(m, "hl_alloc_strbytes") : NULL;
+    if (!thr || !sb) { logf_("debug: test exception unavailable"); return; }
+    logf_("debug: throwing a test exception");
+    static const unsigned short msg[] = {'N','o','r','t','h','g','a','r','d','V','R',' ','t','e','s','t',' ','e','x','c','e','p','t','i','o','n',0};
+    thr(sb(msg));
+}

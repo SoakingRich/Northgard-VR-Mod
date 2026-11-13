@@ -1,0 +1,57 @@
+[project]
+site_name = "Northgard VR — Release Command"
+site_description = "A living go/no-go battle plan for the first public Northgard VR release"
+site_author = "Northgard VR project"
+docs_dir = "docs"
+site_dir = "build/release-site"
+dev_addr = "127.0.0.1:8765"
+repo_url = "https://github.com/SoakingRich/Northgard-VR-Mod"
+repo_name = "SoakingRich/Northgard-VR-Mod"
+nav = [{ "Battle plan" = "index.md" }]
+extra_css = ["stylesheets/release-plan.css"]
+exclude_docs = """
+/ADVANCED.md
+/DEVELOPMENT.md
+/PLAN.md
+/RECON.md
+/RELEASE_CHECKLIST.md
+/Tasks.md
+/images/selection-box.jpg
+"""
+
+[project.theme]
+language = "en"
+font = false
+features = [
+  "navigation.top",
+  "navigation.tracking",
+  "toc.follow",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "blue grey"
+accent = "cyan"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "blue grey"
+accent = "cyan"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"
+
+[project.theme.icon]
+repo = "fontawesome/brands/github"
+
+[project.markdown_extensions]
+attr_list = {}
+tables = {}
+pymdownx.tasklist.custom_checkbox = true
+
+[project.validation]
+invalid_links = true
+invalid_link_anchors = true

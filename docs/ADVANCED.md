@@ -16,6 +16,8 @@ The VR options menu stores its choices in `NorthgardVR_settings.txt` in the Nort
 | `table_height` | 0 auto (below your head), 1 seated, 2 standing |
 | `table_radius` | Table radius in metres (0.35–1.6; also left stick left/right) |
 | `panel_size` | HUD panel size in % (75 / 100 / 125) |
+| `hud_distance` | HUD distance in % of the layout file's positions (75 near / 88 normal / 100 far); panels keep their size |
+| `hand_aim` | cm above (+) or below (−) your eyes that the wrist panel faces (−20 to +10) |
 | `menu_size_w`, `menu_size_h` | Resolution the menus render at (default 1600 × 900) |
 | `debug` | 1 = developer test tools (remote-control files, F-keys, simulator fallback). Leave off. |
 
@@ -31,6 +33,10 @@ full path of a runtime's JSON manifest.
 on the left hand. It is reloaded while the game runs, so you can tune it live. The format is
 described at the top of the file; `lhand` at the end of a line attaches a panel to the left
 controller.
+
+Lines ending in `row` get fixed slots side by side (in file order), centred on the `@row` line.
+Each slot is the line's `width_m` wide and stays in place whether its panel is shown or not; a
+panel too big for its slot is shrunk to fit. `rowup` stacks a panel on top of the one before it.
 
 ## VR notifications
 

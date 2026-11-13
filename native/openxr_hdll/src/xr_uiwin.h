@@ -9,6 +9,11 @@ typedef struct {
     int nflows;     // flows counted in the rect
 } xrw_win;
 int xrw_windows(const xrw_win **out);
-void xr_ui_windows_impl(void *ui);
-void xr_game_event_impl(void *ev);
-void xr_weather_impl(void *w);
+#ifdef _WIN32
+#define XRW_EXPORT __declspec(dllexport)
+#else
+#define XRW_EXPORT
+#endif
+XRW_EXPORT void xr_ui_windows_impl(void *ui);
+XRW_EXPORT void xr_game_event_impl(void *ev);
+XRW_EXPORT void xr_weather_impl(void *w);

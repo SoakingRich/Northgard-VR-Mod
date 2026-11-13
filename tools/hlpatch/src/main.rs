@@ -693,6 +693,71 @@ fn patch_weather(code: &mut Bytecode) {
     inject::insert_ops(&mut code.functions[fp], ins);
 }
 
+/// The game's "a problem occurred" screen: at the end of the
+/// ui.ExceptionReportEnvironment constructor, xr_game_error(this) logs the exception
+/// message and stack.
+fn patch_game_error(code: &mut Bytecode) {
+    let void_t = type_index(code, &Type::Void);
+    let dyn_t = type_index(code, &Type::Dyn);
+    let fp = find_method(code, "ui.$ExceptionReportEnvironment", "__constructor__");
+    let nat = add_native(code, &xr_lib(), "xr_game_error", vec![dyn_t], void_t);
+    let d = new_reg(code, fp, dyn_t);
+    let v = new_reg(code, fp, void_t);
+    let rets = inject::ret_indices(&code.functions[fp]);
+    let ins = rets
+        .into_iter()
+        .map(|i| (i, vec![Opcode::UnsafeCast { dst: d, src: Reg(0) }, Opcode::Call1 { dst: v, fun: nat, arg0: d }]))
+        .collect();
+    inject::insert_ops(&mut code.functions[fp], ins);
+    // ... and xr_game_error_end() when it is disposed ("Continue" / back to the game)
+    let fd = find_method(code, "ui.ExceptionReportEnvironment", "dispose");
+    let end = add_native(code, &xr_lib(), "xr_game_error_end", vec![], void_t);
+    let v2 = new_reg(code, fd, void_t);
+    inject::insert_ops(&mut code.functions[fd], vec![(0, vec![Opcode::Call0 { dst: v2, fun: end }])]);
+}
+
+/// VR map panning moves the game's own camera too (so effects that follow it, like the
+/// weather fog that clears around where you look, follow the map): at the start of
+/// cam.CameraController.camUpdate
+///     if (cameraTarget != null && xr_cam_ctl(cameraTarget.x, cameraTarget.y))
+///         this.move(xr_cam_ctl_x(), xr_cam_ctl_y(), null);
+fn patch_cam_move(code: &mut Bytecode) {
+    let bool_t = type_index(code, &Type::Bool);
+    let f64_t = type_index(code, &Type::F64);
+    let void_t = type_index(code, &Type::Void);
+    let fp = find_method(code, "cam.CameraController", "camUpdate");
+    let mv = find_method(code, "cam.CameraController", "move");
+    let mv_fi = code.functions[mv].findex;
+    let null_f64_t = match &code.types[code.functions[mv].t.0] {
+        Type::Fun(tf) => tf.args[3],
+        _ => panic!("CameraController.move has an unexpected type"),
+    };
+    let (ct_f, ct_t) = field_index(code, "cam.CameraController", "cameraTarget");
+    let ctl = add_native(code, &xr_lib(), "xr_cam_ctl", vec![f64_t, f64_t], bool_t);
+    let gx = add_native(code, &xr_lib(), "xr_cam_ctl_x", vec![], f64_t);
+    let gy = add_native(code, &xr_lib(), "xr_cam_ctl_y", vec![], f64_t);
+    let t = new_reg(code, fp, ct_t);
+    let x = new_reg(code, fp, f64_t);
+    let y = new_reg(code, fp, f64_t);
+    let b = new_reg(code, fp, bool_t);
+    let sp = new_reg(code, fp, null_f64_t);
+    let v = new_reg(code, fp, void_t);
+    // virtual<speed, x, y>: fields 0, 1, 2 (as CameraController.move writes them)
+    let ops = vec![
+        Opcode::GetThis { dst: t, field: ct_f },
+        Opcode::JNull { reg: t, offset: 8 },
+        Opcode::Field { dst: x, obj: t, field: RefField(1) },
+        Opcode::Field { dst: y, obj: t, field: RefField(2) },
+        Opcode::Call2 { dst: b, fun: ctl, arg0: x, arg1: y },
+        Opcode::JFalse { cond: b, offset: 4 },
+        Opcode::Call0 { dst: x, fun: gx },
+        Opcode::Call0 { dst: y, fun: gy },
+        Opcode::Null { dst: sp },
+        Opcode::Call4 { dst: v, fun: mv_fi, arg0: Reg(0), arg1: x, arg2: y, arg3: sp },
+    ];
+    inject::insert_ops(&mut code.functions[fp], vec![(0, ops)]);
+}
+
 /// Match render size before the map loads: at the start of map.LoadMap.start call
 /// xr_loading(), so the engine resizes to the eye size while the loading screen is up,
 /// before the match's renderer objects exist (a resize later breaks the building preview).
@@ -827,6 +892,8 @@ fn main() -> ExitCode {
                 patch_loading(&mut code);
                 patch_exit(&mut code);
                 patch_game_hook(&mut code);
+                patch_cam_move(&mut code);
+                patch_game_error(&mut code);
             }
             save(&code, &args[4]);
             let check = load(&args[4]); // verify the output parses again
@@ -845,6 +912,29 @@ fn main() -> ExitCode {
                             println!("{}@{} op {i}: src reg{} ; prev {prev}", f.name(&code), f.findex.0, src.0);
                         }
                     }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Some("field-uses") if args.len() == 5 => {
+            // hlpatch field-uses <TypeName> <field index> <in.dat>: functions that read or write it
+            let code = load(&args[4]);
+            let fi: usize = args[3].parse().unwrap();
+            for f in code.functions.iter() {
+                let this_t = f.regs.first().and_then(|r| type_name(&code, *r));
+                let mut r = 0; let mut w = 0;
+                for op in f.ops.iter() {
+                    match op {
+                        Opcode::Field { obj, field, .. } if field.0 == fi && type_name(&code, f.regs[obj.0 as usize]).as_deref() == Some(args[2].as_str()) => r += 1,
+                        Opcode::SetField { obj, field, .. } if field.0 == fi && type_name(&code, f.regs[obj.0 as usize]).as_deref() == Some(args[2].as_str()) => w += 1,
+                        Opcode::GetThis { field, .. } if field.0 == fi && this_t.as_deref() == Some(args[2].as_str()) => r += 1,
+                        Opcode::SetThis { field, .. } if field.0 == fi && this_t.as_deref() == Some(args[2].as_str()) => w += 1,
+                        _ => {}
+                    }
+                }
+                if r + w > 0 {
+                    let parent = f.parent.and_then(|p| type_name(&code, p)).unwrap_or_default();
+                    println!("{}.{}@{}  reads {r} writes {w}", parent, f.name(&code), f.findex.0);
                 }
             }
             ExitCode::SUCCESS

@@ -38,7 +38,7 @@ missing, then starts `Northgard.exe vrboot.dat`. `NorthgardVR_lib.txt` names the
 
 `scripts/make_release.sh <version>` builds `dist/NorthgardVR-<version>.zip`. GitHub Actions
 (`.github/workflows/release.yml`) runs the same script on every push and publishes a
-pre-release for tags `v*`. Before tagging:
+GitHub release for tags `v*`. Before tagging:
 
 1. Run the simulator checklist in [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md).
 2. Move the notes in [CHANGELOG.md](../CHANGELOG.md) from "Unreleased" to the new version.

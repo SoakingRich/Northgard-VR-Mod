@@ -1126,7 +1126,6 @@ static int start(ID3D11Texture2D *bb) {
     XR_CHECK(p_xrEnumerateSwapchainImages(g_ui_swap, 8, &nui, (XrSwapchainImageBaseHeader *)g_ui_images));
     logf_("XR: session created; swapchains %dx%d format %d (%u images)", g_sw_w, g_sw_h, (int)g_sw_fmt, g_nimages);
     mr_init();
-    vr_notify("NorthgardVR ready. Left stick click: VR options.", 0, 6);
     pointer_visuals_init();
     xr_window_mirror(g_rec_w, g_rec_h);
     return 1;
@@ -1150,6 +1149,8 @@ static void poll_events(void) {
             XrEventDataSessionStateChanged *e = (XrEventDataSessionStateChanged *)&ev;
             g_sess_state = e->state;
             logf_("XR: session state -> %d", (int)e->state);
+            if (e->state != XR_SESSION_STATE_FOCUSED)
+                xr_pointer_cancel("XR session not focused", 1);
             if (e->state == XR_SESSION_STATE_READY) {
                 XrSessionBeginInfo bi = {XR_TYPE_SESSION_BEGIN_INFO};
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -1171,6 +1172,8 @@ static void poll_events(void) {
 // (defined further down)
 static XrCompositionLayerQuad g_hit_q[15];
 static int g_quad_hand[15]; // quad i of the last layout is on the left hand
+enum { HIT_TALLY_SOURCE = 1 };
+static unsigned char g_quad_hit_flags[15];
 static int g_tip_anchor_hand; // the laser's panel is on the hand
 
 static XrSwapchain g_opt_swap = XR_NULL_HANDLE;
@@ -1179,7 +1182,8 @@ int xrt_weather_on(void) {
     if (g_weather < 0) g_weather = settings_int("weather", 0) != 0;
     return g_weather;
 }
-static int g_opt_open, g_opt_dirty = 1, g_opt_hover = -1, g_opt_ready;
+int xrt_input_focused(void) { return g_running && g_sess_state == XR_SESSION_STATE_FOCUSED; }
+static int g_opt_open, g_opt_dirty = 1, g_opt_hover = -1, g_opt_ready, g_opt_page;
 static float g_menu_halfw = 1.42f; // half width of the menu screen (m)
 static XrCompositionLayerQuad g_opt_quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
 static int opt_hit(const float o[3], const float d[3], float *dist, int *row);
@@ -1247,10 +1251,19 @@ static void submit(ID3D11Texture2D *bb) {
     XrFrameState fs = {XR_TYPE_FRAME_STATE};
     static int nfail;
     XrResult wr = p_xrWaitFrame(g_sess, &fwi, &fs);
-    if (XR_FAILED(wr)) { if (nfail++ < 5) logf_("XR: theater xrWaitFrame failed (%d)", (int)wr); return; }
+    if (XR_FAILED(wr)) {
+        if (nfail++ < 5) logf_("XR: theater xrWaitFrame failed (%d)", (int)wr);
+        xr_pointer_cancel("flat xrWaitFrame failed", 1);
+        return;
+    }
     XrFrameBeginInfo fbi = {XR_TYPE_FRAME_BEGIN_INFO};
     XrResult br = p_xrBeginFrame(g_sess, &fbi);
-    if (XR_FAILED(br)) { if (nfail++ < 5) logf_("XR: theater xrBeginFrame failed (%d)", (int)br); return; }
+    if (XR_FAILED(br)) {
+        if (nfail++ < 5) logf_("XR: theater xrBeginFrame failed (%d)", (int)br);
+        xr_pointer_cancel("flat xrBeginFrame failed", 1);
+        return;
+    }
+    if (!fs.shouldRender) xr_pointer_cancel("flat frame not rendered", 1);
     { static long was_stereo; // log the switch back from the match
       if (g_stereo_frames != was_stereo) { logf_("XR: flat menu screen again"); was_stereo = g_stereo_frames; } }
 
@@ -1325,6 +1338,7 @@ static void submit(ID3D11Texture2D *bb) {
             // panel (hover, trigger or A = click).
             g_hit_q[0] = quad;
             g_quad_hand[0] = 0;
+            g_quad_hit_flags[0] = 0;
             g_nhit = 1;
             xr_input in;
             g_fs.predictedDisplayTime = fs.predictedDisplayTime; // read_input locates the controllers at this time
@@ -1345,6 +1359,8 @@ static void submit(ID3D11Texture2D *bb) {
                 int nl = pointer_quads(lq, head, 0);
                 for (int i = 0; i < nl; i++) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&lq[i];
             }
+        } else {
+            xr_pointer_cancel("flat menu swapchain unavailable", 1);
         }
     }
 
@@ -1651,7 +1667,13 @@ static int mask_copy(int e, uint32_t idx, ID3D11Texture2D *dst, ID3D11Texture2D 
 // z towards you; origin = table centre). yaw/pitch in degrees (pitch -90 =
 // lying flat, face up). Lines starting with # are ignored.
 // Without the file the whole UI shows as one panel.
-typedef struct { char name[32]; float ax, ay, x, y, w, h, p[3], yaw, pitch, width; int autobox; char win[192]; int rest; int hand; } ui_panel;
+typedef struct { char name[32]; float ax, ay, x, y, w, h, p[3], yaw, pitch, width; int autobox; char win[192]; int rest; int hand; int row; } ui_panel;
+// Packed HUD row ("row" lines): members side by side, centred on g_row (table space
+// x y z, yaw, pitch, gap in metres); "rowup" stacks on the member before it,
+// "rowend" hangs off the row's right end with its own angle.
+enum { ROW_NONE, ROW_IN, ROW_UP };
+static float g_row[6] = {0.05f, 0.08f, -0.90f, 0, -10, 0.02f};
+#define ROW_MAX_H 0.36f // tallest a row panel gets (metres): keeps it under the top bar
 
 // Auto-sized panels. Some HUD elements change size (the build menu and unit
 // tallies with the faction/units, the selection summary with what's
@@ -1829,6 +1851,11 @@ static void load_layout(void) {
         // optional 13th column: "lhand" = attached to the left controller (p, yaw, pitch
         // relative to the grip), otherwise placed around the table
         q.hand = nf == 13 && !_stricmp(space, "lhand");
+        q.row = nf < 13 ? ROW_NONE : !_stricmp(space, "row") ? ROW_IN : !_stricmp(space, "rowup") ? ROW_UP : ROW_NONE;
+        if (!strcmp(anchor, "@row")) { // where the packed row sits: p = bottom centre, width column = gap
+            g_row[0] = q.p[0]; g_row[1] = q.p[1]; g_row[2] = q.p[2]; g_row[3] = q.yaw; g_row[4] = q.pitch; g_row[5] = q.width;
+            continue;
+        }
         q.autobox = -1;
         if (!strcmp(anchor, "@notify")) { // VR notifications: p = TOP centre of the stack
             g_ntf_cfg[0] = q.p[0]; g_ntf_cfg[1] = q.p[1]; g_ntf_cfg[2] = q.p[2];
@@ -1865,10 +1892,11 @@ static XrQuaternionf quat_yaw_pitch(float yaw, float pitch) {
 
 // Ray (stage space) against the HUD panels. On a hit returns 1 with the UI
 // pixel (engine pixels) and the distance along the ray.
-int xrt_panel_hit(const float o[3], const float d[3], float *ux, float *uy, float *dist) {
+int xrt_panel_hit(const float o[3], const float d[3], float *ux, float *uy, float *dist, int *tally) {
     float best = 1e9f;
     int hit = 0;
     int besti = -1;
+    if (tally) *tally = 0;
     for (int i = 0; i < g_nhit; i++) {
         if (i == g_tip_qi) continue;
         XrCompositionLayerQuad *L = &g_hit_q[i];
@@ -1904,6 +1932,18 @@ int xrt_panel_hit(const float o[3], const float d[3], float *ux, float *uy, floa
         g_tip_anchor_hand = g_quad_hand[besti];
         g_tip_anchor_frame = g_stereo_frames;
         g_tip_anchor_ok = 1;
+        if (tally && (g_quad_hit_flags[besti] & HIT_TALLY_SOURCE)) {
+            const xrw_win *w;
+            int n = xrw_windows(&w);
+            for (int i = 0; i < n; i++) {
+                if (w[i].vis && !strcmp(w[i].cls, "ui.win.units.AllUnits") &&
+                    *ux >= w[i].x && *ux < w[i].x + w[i].w &&
+                    *uy >= w[i].y && *uy < w[i].y + w[i].h) {
+                    *tally = 1;
+                    break;
+                }
+            }
+        }
     }
     return hit;
 }
@@ -1987,6 +2027,19 @@ static void resolve_windows(prect *pr) {
 // Fills quad layers for the layout panels. Returns how many were added.
 static int g_panel_pct = -1; // HUD panel size, % (VR options)
 static int settings_int(const char *key, int def);
+// VR options "HUD distance": the panels around the table are pulled towards you (they keep
+// their size). 88 % by default (a little closer than the layout file).
+static int g_hud_pct = -1;
+static float xrt_hud_distance(void) {
+    if (g_hud_pct < 0) { g_hud_pct = settings_int("hud_distance", 88); if (g_hud_pct < 50 || g_hud_pct > 150) g_hud_pct = 88; }
+    return g_hud_pct / 100.0f;
+}
+// VR options "Hand menu aim": the wrist panel faces a point this many cm above (+) or below (-) your eyes.
+static int g_hand_aim = -1000;
+static float xrt_hand_aim(void) {
+    if (g_hand_aim == -1000) { g_hand_aim = settings_int("hand_aim", 0); if (g_hand_aim < -40 || g_hand_aim > 20) g_hand_aim = 0; }
+    return g_hand_aim / 100.0f;
+}
 static float xrt_panel_scale(void) {
     if (g_panel_pct < 0) { g_panel_pct = settings_int("panel_size", 100); if (g_panel_pct < 50 || g_panel_pct > 200) g_panel_pct = 100; }
     return g_panel_pct / 100.0f;
@@ -2002,6 +2055,8 @@ static int layout_quads(XrCompositionLayerQuad *quads, int max) {
     memset(pr, 0, sizeof(pr));
     resolve_windows(pr);
     g_tip_qi = -1;
+    int rowq[16], rowkind[16], nrow = 0, nopull[32] = {0};
+    ui_panel *rowp[16];
     { // Pause / Options / Save-Load (the escape menu): one flat screen in front of you with
       // the middle of the UI image, like the main menu. Its pages scroll and mask their
       // content, so cutting them into panels by element bounds doesn't work.
@@ -2036,6 +2091,7 @@ static int layout_quads(XrCompositionLayerQuad *quads, int max) {
             XrCompositionLayerQuad *L = &quads[nq];
             memset(L, 0, sizeof(*L));
             g_quad_hand[nq] = 0;
+            g_quad_hit_flags[nq] = 0;
             nq++;
             L->type = XR_TYPE_COMPOSITION_LAYER_QUAD;
             L->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -2078,6 +2134,9 @@ static int layout_quads(XrCompositionLayerQuad *quads, int max) {
         if (ry + rh > g_cp_h) rh = g_cp_h - ry;
         if (rw <= 0 || rh <= 0) continue;
         g_quad_hand[nq] = q->hand;
+        g_quad_hit_flags[nq] =
+            !q->rest && pattern_match(q->win, "ui.win.units.AllUnits")
+                ? HIT_TALLY_SOURCE : 0;
         XrCompositionLayerQuad *L = &quads[nq++];
         memset(L, 0, sizeof(*L));
         L->type = XR_TYPE_COMPOSITION_LAYER_QUAD;
@@ -2141,6 +2200,7 @@ static int layout_quads(XrCompositionLayerQuad *quads, int max) {
             L->pose.position.x = hp[0] + hx / hl * 0.05f;
             L->pose.position.y = hp[1] + hy / hl * 0.05f + L->size.height / 2 + 0.04f;
             L->pose.position.z = hp[2] + hz / hl * 0.05f;
+            nopull[nq - 1] = 1; // at the laser
             continue;
         }
         if (is_win && !strcmp(q->win, "tip")) {
@@ -2163,6 +2223,7 @@ static int layout_quads(XrCompositionLayerQuad *quads, int max) {
                 L->pose.position.x = hp[0] + hx / hl * 0.08f;
                 L->pose.position.y = hp[1] + hy / hl * 0.08f + L->size.height / 2 + 0.05f;
                 L->pose.position.z = hp[2] + hz / hl * 0.08f;
+                nopull[nq - 1] = 1;
                 continue;
             }
         }
@@ -2187,6 +2248,15 @@ static int layout_quads(XrCompositionLayerQuad *quads, int max) {
             L->pose.position.x = g_tip_anchor[0] + upx * lift + rx_ * side + nx * fwd;
             L->pose.position.y = g_tip_anchor[1] + upy * lift + ry_ * side + ny * fwd;
             L->pose.position.z = g_tip_anchor[2] + upz * lift + rz_ * side + nz * fwd;
+            nopull[nq - 1] = 1; // already next to a (pulled) panel
+            continue;
+        }
+        if (q->row != ROW_NONE) {
+            float mpp = (q->width * S) / (q->w > 0 ? q->w : 280);
+            if (!(q->autobox >= 0 || is_win)) mpp = (q->width * S) / (rw > 0 ? rw : 1); // fixed rect: width_m is its width
+            L->size.width = rw * mpp;
+            L->size.height = rh * mpp;
+            if (nrow < 16) { rowq[nrow] = nq - 1; rowkind[nrow] = q->row; rowp[nrow] = q; nrow++; }
             continue;
         }
         if (q->autobox >= 0 || is_win) {
@@ -2197,12 +2267,89 @@ static int layout_quads(XrCompositionLayerQuad *quads, int max) {
             L->size.height = rh * mpp;
             XrQuaternionf o = L->pose.orientation;
             float upx = 2 * (o.x * o.y - o.w * o.z), upy = 1 - 2 * (o.x * o.x + o.z * o.z), upz = 2 * (o.y * o.z + o.w * o.x);
+            float bx = L->pose.position.x, by = L->pose.position.y, bz = L->pose.position.z; // bottom centre
             L->pose.position.x += upx * L->size.height / 2;
             L->pose.position.y += upy * L->size.height / 2;
             L->pose.position.z += upz * L->size.height / 2;
+            if (q->hand) {
+                // The billboard was aimed from the panel's bottom edge, so the panel's middle
+                // looked over your head. Aim from the middle instead, at your eyes plus the
+                // "Hand menu aim" offset; the bottom edge stays where it was.
+                float tx = (g_views[0].pose.position.x + g_views[1].pose.position.x) * 0.5f;
+                float ty = (g_views[0].pose.position.y + g_views[1].pose.position.y) * 0.5f + xrt_hand_aim();
+                float tz = (g_views[0].pose.position.z + g_views[1].pose.position.z) * 0.5f;
+                for (int it = 0; it < 2; it++) {
+                    float hx = tx - L->pose.position.x, hy = ty - L->pose.position.y, hz = tz - L->pose.position.z;
+                    if (hx * hx + hz * hz < 1e-6f) break;
+                    XrQuaternionf o2 = quat_yaw_pitch(atan2f(hx, hz), -atan2f(hy, sqrtf(hx * hx + hz * hz)));
+                    float ux = 2 * (o2.x * o2.y - o2.w * o2.z), uy = 1 - 2 * (o2.x * o2.x + o2.z * o2.z), uz = 2 * (o2.y * o2.z + o2.w * o2.x);
+                    L->pose.orientation = o2;
+                    L->pose.position.x = bx + ux * L->size.height / 2;
+                    L->pose.position.y = by + uy * L->size.height / 2;
+                    L->pose.position.z = bz + uz * L->size.height / 2;
+                }
+            }
         } else {
             L->size.width = (q->width * S);
             L->size.height = (q->width * S) * rh / rw;
+        }
+    }
+    if (nrow) { // the row: fixed slots, one per "row" line (file order), whether shown or not, so
+                // nothing moves when the selection changes; a panel wider than its slot (width_m)
+                // or taller than ROW_MAX_H shrinks to fit; "rowup" stacks on the slot before it
+        float slotx[64], slotw[64] = {0}; int slotof[64]; int ns = -1;
+        for (int i = 0; i < g_npanels && i < 64; i++) {
+            ui_panel *q = &g_panels[i];
+            slotof[i] = -1;
+            if (q->row == ROW_IN || (q->row == ROW_UP && ns < 0)) ns++;
+            if (q->row != ROW_IN && q->row != ROW_UP) continue;
+            slotof[i] = ns;
+            if (q->width * S > slotw[ns]) slotw[ns] = q->width * S;
+        }
+        ns++;
+        float gap = g_row[5] * S, total = 0;
+        for (int j = 0; j < ns; j++) total += slotw[j] + (j ? gap : 0);
+        float acc = -total / 2;
+        for (int j = 0; j < ns; j++) { slotx[j] = acc + slotw[j] / 2; acc += slotw[j] + gap; }
+        XrQuaternionf O = quat_yaw_pitch(tab[3] + g_row[3] * 0.0174533f, g_row[4] * 0.0174533f);
+        float rxv = 1 - 2 * (O.y * O.y + O.z * O.z), ryv = 2 * (O.x * O.y + O.w * O.z), rzv = 2 * (O.x * O.z - O.w * O.y);
+        float uxv = 2 * (O.x * O.y - O.w * O.z), uyv = 1 - 2 * (O.x * O.x + O.z * O.z), uzv = 2 * (O.y * O.z + O.w * O.x);
+        float lx = g_row[0] * k, lz = g_row[2] * k;
+        float bx = tab[0] + c * lx + s * lz, by = tab[1] + g_row[1], bz = tab[2] - s * lx + c * lz; // row bottom centre
+        float stack[64] = {0};
+        for (int r = 0; r < nrow; r++) {
+            XrCompositionLayerQuad *L = &quads[rowq[r]];
+            int pi = (int)(rowp[r] - g_panels), j = pi >= 0 && pi < 64 ? slotof[pi] : -1;
+            if (j < 0) continue;
+            float f = 1;
+            if (L->size.width > slotw[j]) f = slotw[j] / L->size.width;
+            if (L->size.height * f > ROW_MAX_H * S) f = ROW_MAX_H * S / L->size.height;
+            { static int lw[64], lh[64];
+              int iw = (int)(L->subImage.imageRect.extent.width), ih = (int)(L->subImage.imageRect.extent.height);
+              if (pi < 64 && (abs(iw - lw[pi]) > 8 || abs(ih - lh[pi]) > 8)) {
+                  lw[pi] = iw; lh[pi] = ih;
+                  logf_("row: %s %dx%d px -> %.2fx%.2f m (slot %d, %.2f m, shrink %.2f)", rowp[r]->name, iw, ih, L->size.width * f, L->size.height * f, j, slotw[j], f);
+              } }
+            L->size.width *= f; L->size.height *= f;
+            float h = L->size.height, up = stack[j] + h / 2;
+            stack[j] += h + gap * 0.5f;
+            L->pose.orientation = O;
+            L->pose.position.x = bx + rxv * slotx[j] + uxv * up;
+            L->pose.position.y = by + ryv * slotx[j] + uyv * up;
+            L->pose.position.z = bz + rzv * slotx[j] + uzv * up;
+        }
+    }
+    { // HUD distance (VR options): pull the panels around the table towards where you sit
+        float f = xrt_hud_distance();
+        if (f != 1.0f) {
+            float rlz = tab[4] + 0.10f; // you sit ~10 cm behind the near edge, ~0.7 m above the table
+            float ref[3] = {tab[0] + s * rlz, tab[1] + 0.70f, tab[2] + c * rlz};
+            for (int i = 0; i < nq; i++) {
+                if (g_quad_hand[i] || nopull[i]) continue;
+                quads[i].pose.position.x = ref[0] + (quads[i].pose.position.x - ref[0]) * f;
+                quads[i].pose.position.y = ref[1] + (quads[i].pose.position.y - ref[1]) * f;
+                quads[i].pose.position.z = ref[2] + (quads[i].pose.position.z - ref[2]) * f;
+            }
         }
     }
     return nq;
@@ -2297,10 +2444,14 @@ void dio_set_open_map(int on);
 int dio_table_height_mode(void);           // openxr_hdll.c: 0 auto, 1 seated, 2 standing
 void dio_set_table_height_mode(int m);
 #define OPT_W 640
-#define OPT_H 890
-#define OPT_ROWS 10
-#define OPT_ROW_Y0 86
-#define OPT_ROW_H 78
+#define OPT_H 1114
+#define OPT_PAGE_SETTINGS 0
+#define OPT_PAGE_CONTROLS 1
+#define OPT_ROWS 13
+#define OPT_CONTROL_ROWS 14
+#define OPT_CONTROL_BACK (OPT_CONTROL_ROWS - 1)
+#define OPT_ROW_Y0 92
+#define OPT_ROW_H 68
 static const float OPT_WM = 0.48f; // metres wide
 
 static void settings_set(const char *key, const char *val) {
@@ -2413,10 +2564,89 @@ static void opt_row_text(int r, char *label, char *value, size_t n) {
         sprintf_s(value, n, "%d%%", (int)(xrt_panel_scale() * 100 + 0.5f));
         break;
     case 7:
+        strcpy_s(label, n, "HUD distance");
+        sprintf_s(value, n, "%s (%d%%)", g_hud_pct <= 75 ? "Near" : g_hud_pct >= 100 ? "Far" : "Normal", (int)(xrt_hud_distance() * 100 + 0.5f));
+        break;
+    case 8: {
+        int a = (int)(xrt_hand_aim() * 100 + (xrt_hand_aim() < 0 ? -0.5f : 0.5f));
+        strcpy_s(label, n, "Hand menu aim");
+        if (a == 0) strcpy_s(value, n, "At your eyes");
+        else sprintf_s(value, n, "%d cm %s your eyes", a < 0 ? -a : a, a < 0 ? "below" : "above");
+        break;
+    }
+    case 9:
+        strcpy_s(label, n, "Controls");
+        strcpy_s(value, n, "View guide >");
+        break;
+    case 10:
         strcpy_s(label, n, "Log");
         strcpy_s(value, n, "Open folder");
         break;
-    case 8: strcpy_s(label, n, "Close"); break;
+    case 11: strcpy_s(label, n, "Close"); break;
+    }
+}
+
+static void opt_control_text(int r, char *label, char *value, size_t n) {
+    const int left = xrt_left_handed();
+    const char *pointer = left ? "Left" : "Right";
+    const char *other = left ? "Right" : "Left";
+    label[0] = value[0] = 0;
+    switch (r) {
+    case 0:
+        sprintf_s(label, n, "%s stick click / %s", pointer, left ? "A" : "X");
+        strcpy_s(value, n, "Game pause menu / Escape");
+        break;
+    case 1:
+        strcpy_s(label, n, "Left menu button");
+        strcpy_s(value, n, "Pause if the runtime exposes it");
+        break;
+    case 2:
+        sprintf_s(label, n, "%s thumbstick click", other);
+        strcpy_s(value, n, "Open / close VR menu");
+        break;
+    case 3:
+        sprintf_s(label, n, "%s controller laser", pointer);
+        strcpy_s(value, n, "Aim at map, HUD and menus");
+        break;
+    case 4:
+        sprintf_s(label, n, "%s trigger", pointer);
+        strcpy_s(value, n, "Click / orders with units selected");
+        break;
+    case 5:
+        sprintf_s(label, n, "%s trigger (hold)", other);
+        strcpy_s(value, n, "Add selection; Unit Tally: add all");
+        break;
+    case 6:
+        strcpy_s(label, n, left ? "X" : "A");
+        strcpy_s(value, n, "Select; hold to drag a box");
+        break;
+    case 7:
+        strcpy_s(label, n, left ? "Y" : "B");
+        strcpy_s(value, n, "Cancel building placement");
+        break;
+    case 8:
+        strcpy_s(label, n, "One grip");
+        strcpy_s(value, n, "Drag map / table height");
+        break;
+    case 9:
+        strcpy_s(label, n, "Both grips");
+        strcpy_s(value, n, "Zoom / rotate map");
+        break;
+    case 10:
+        sprintf_s(label, n, "%s thumbstick", pointer);
+        strcpy_s(value, n, "Rotate / zoom");
+        break;
+    case 11:
+        sprintf_s(label, n, "%s thumbstick left / right", other);
+        strcpy_s(value, n, "Resize table");
+        break;
+    case 12:
+        strcpy_s(label, n, left ? "B" : "Y");
+        strcpy_s(value, n, "Reset map view");
+        break;
+    case OPT_CONTROL_BACK:
+        strcpy_s(label, n, "Back");
+        break;
     }
 }
 
@@ -2446,8 +2676,9 @@ static void opt_render(void) {
     HFONT fs = CreateFontA(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
     SelectObject(dc, ft);
     SetTextColor(dc, RGB(235, 225, 200));
-    RECT tr = {24, 18, OPT_W - 24, 70};
-    DrawTextA(dc, "NorthgardVR options", -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT tr = {24, 10, OPT_W - 24, 52};
+    DrawTextA(dc, g_opt_page == OPT_PAGE_CONTROLS ? "VR controls" : "NorthgardVR options", -1, &tr,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     { // version, top right
         const char *xr_version(void);
         SelectObject(dc, fs);
@@ -2456,15 +2687,25 @@ static void opt_render(void) {
         sprintf_s(vt, sizeof(vt), "%s", xr_version());
         DrawTextA(dc, vt, -1, &tr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
-    for (int r = 0; r < OPT_ROWS; r++) {
+    SelectObject(dc, fs);
+    SetTextColor(dc, RGB(140, 210, 255));
+    RECT pr = {24, 52, OPT_W - 24, 90};
+    char pause_hint[96];
+    sprintf_s(pause_hint, sizeof(pause_hint), "Game pause: %s thumbstick click or %s",
+              xrt_left_handed() ? "left" : "right", xrt_left_handed() ? "A" : "X");
+    DrawTextA(dc, pause_hint, -1, &pr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    int rows = g_opt_page == OPT_PAGE_CONTROLS ? OPT_CONTROL_ROWS : OPT_ROWS;
+    for (int r = 0; r < rows; r++) {
         RECT rr = {16, OPT_ROW_Y0 + r * OPT_ROW_H, OPT_W - 16, OPT_ROW_Y0 + r * OPT_ROW_H + OPT_ROW_H - 10};
-        HBRUSH rb = CreateSolidBrush(r == g_opt_hover ? RGB(60, 92, 128) : RGB(36, 46, 58));
+        int interactive = g_opt_page == OPT_PAGE_SETTINGS || r == OPT_CONTROL_BACK;
+        HBRUSH rb = CreateSolidBrush(interactive && r == g_opt_hover ? RGB(60, 92, 128) : RGB(36, 46, 58));
         FillRect(dc, &rr, rb);
         DeleteObject(rb);
         FrameRect(dc, &rr, edge);
         char label[64], value[64];
-        opt_row_text(r, label, value, sizeof(label));
-        SelectObject(dc, fr);
+        if (g_opt_page == OPT_PAGE_CONTROLS) opt_control_text(r, label, value, sizeof(label));
+        else opt_row_text(r, label, value, sizeof(label));
+        SelectObject(dc, g_opt_page == OPT_PAGE_CONTROLS ? fs : fr);
         SetTextColor(dc, RGB(230, 230, 230));
         RECT lr = rr;
         lr.left += 16;
@@ -2476,9 +2717,11 @@ static void opt_render(void) {
     }
     SelectObject(dc, fs);
     SetTextColor(dc, RGB(170, 170, 160));
-    RECT hr = {24, OPT_ROW_Y0 + OPT_ROWS * OPT_ROW_H - 4, OPT_W - 24, OPT_H - 6};
-    char hint[160];
-    if (g_mr == 3) {
+    RECT hr = {24, OPT_ROW_Y0 + rows * OPT_ROW_H + 2, OPT_W - 24, OPT_H - 6};
+    char hint[192];
+    if (g_opt_page == OPT_PAGE_CONTROLS) {
+        sprintf_s(hint, sizeof(hint), "Trigger: Back   %s thumbstick click: close", xrt_left_handed() ? "Right" : "Left");
+    } else if (g_mr == 3) {
         int k = key_index();
         (void)k;
         sprintf_s(hint, sizeof(hint), "VD: Streaming > VR Passthrough > Configure: R%u G%u B%u",
@@ -2574,12 +2817,23 @@ static int opt_hit(const float o[3], const float d[3], float *dist, int *row) {
     if (u < 0 || u > 1 || v < 0 || v > 1) return 0;
     *dist = t;
     int py = (int)(v * OPT_H) - OPT_ROW_Y0;
-    *row = (py >= 0 && py % OPT_ROW_H < OPT_ROW_H - 10 && py / OPT_ROW_H < OPT_ROWS) ? py / OPT_ROW_H : -1;
+    int rows = g_opt_page == OPT_PAGE_CONTROLS ? OPT_CONTROL_ROWS : OPT_ROWS;
+    *row = (py >= 0 && py % OPT_ROW_H < OPT_ROW_H - 10 && py / OPT_ROW_H < rows) ? py / OPT_ROW_H : -1;
+    if (g_opt_page == OPT_PAGE_CONTROLS && *row != OPT_CONTROL_BACK) *row = -1;
     return 1;
 }
 
 static void opt_set_mr(int next);
 static void opt_activate(int row) {
+    if (g_opt_page == OPT_PAGE_CONTROLS) {
+        if (row == OPT_CONTROL_BACK) {
+            g_opt_page = OPT_PAGE_SETTINGS;
+            g_opt_hover = -1;
+            logf_("options: controls page closed");
+        }
+        g_opt_dirty = 1;
+        return;
+    }
     if (row == 0) { // Background: None -> Stormy -> Dusk -> Passthrough (chroma key) -> None
         if (g_mr) { opt_set_mr(0); g_sky = 0; }
         else if (xrt_sky() < NSKY - 1) g_sky = xrt_sky() + 1;
@@ -2639,8 +2893,35 @@ static void opt_activate(int row) {
         logf_("options: panel size -> %d%%", nx);
         break;
     }
-    case 7: open_log_folder(); break;
-    case 8: g_opt_open = 0; break;
+    case 7: {
+        static const int steps[] = {75, 88, 100};
+        int cur = (int)(xrt_hud_distance() * 100 + 0.5f), nx = 75;
+        for (int i2 = 0; i2 < 3; i2++) if (steps[i2] == cur) nx = steps[(i2 + 1) % 3];
+        g_hud_pct = nx;
+        char b[8]; sprintf_s(b, sizeof(b), "%d", nx); settings_set("hud_distance", b);
+        logf_("options: HUD distance -> %d%%", nx);
+        break;
+    }
+    case 8: {
+        static const int steps[] = {0, -5, -10, -15, -20, 5, 10};
+        int cur = (int)(xrt_hand_aim() * 100 + (xrt_hand_aim() < 0 ? -0.5f : 0.5f)), nx = 0;
+        for (int i2 = 0; i2 < 7; i2++) if (steps[i2] == cur) nx = steps[(i2 + 1) % 7];
+        g_hand_aim = nx;
+        char b[8]; sprintf_s(b, sizeof(b), "%d", nx); settings_set("hand_aim", b);
+        logf_("options: hand menu aim -> %d cm", nx);
+        break;
+    }
+    case 9:
+        g_opt_page = OPT_PAGE_CONTROLS;
+        g_opt_hover = -1;
+        logf_("options: controls page opened");
+        break;
+    case 10: open_log_folder(); break;
+    case 11:
+        g_opt_open = 0;
+        g_opt_page = OPT_PAGE_SETTINGS;
+        g_opt_hover = -1;
+        break;
     }
     g_opt_dirty = 1;
 }
@@ -2657,27 +2938,35 @@ static void opt_set_mr(int next) {
 int xrt_options_input(const xr_input *in) {
     static int prev_click, prev_trig;
     int click = in->stick_click[0];
-    if (click && !prev_click) {
+    int toggled = click && !prev_click;
+    if (toggled) {
         opt_init();
         g_opt_open = !g_opt_open;
-        if (g_opt_open) { opt_place(); g_opt_dirty = 1; }
+        g_opt_hover = -1;
+        if (g_opt_open) { g_opt_page = OPT_PAGE_SETTINGS; opt_place(); g_opt_dirty = 1; }
         logf_("options menu %s", g_opt_open ? "opened" : "closed");
     }
     prev_click = click;
     int trig = in->trigger[1] > 0.6f;
     int edge = trig && !prev_trig;
     prev_trig = trig;
-    if (!in->aim_valid[1]) return 0;
+    if (toggled && g_opt_open) return 1; // opening gesture cannot also activate a row
+    if (!in->aim_valid[1]) return g_opt_open ? 1 : toggled ? 2 : 0;
     if (!g_opt_open) { // notifications: hover + trigger dismisses
+        if (toggled) return 2; // menu just closed: do not leak held controls to the game
         float o[3] = {in->aim_pos[1][0], in->aim_pos[1][1], in->aim_pos[1][2]};
         float qx = in->aim_quat[1][0], qy = in->aim_quat[1][1], qz = in->aim_quat[1][2], qw = in->aim_quat[1][3];
         float d[3] = {-2 * (qx * qz + qw * qy), -2 * (qy * qz - qw * qx), -(1 - 2 * (qx * qx + qy * qy))};
         float nd;
         int nr;
-        if (!ntf_hit(o, d, &nd, &nr)) { if (g_ntf_hover != -1) { g_ntf_hover = -1; g_ntf_dirty = 1; } return 0; }
+        if (!ntf_hit(o, d, &nd, &nr)) {
+            int left_notification = g_ntf_hover != -1;
+            if (left_notification) { g_ntf_hover = -1; g_ntf_dirty = 1; }
+            return left_notification ? 2 : 0; // do not leak a held dismiss control into the game
+        }
         if (nr != g_ntf_hover) { g_ntf_hover = nr; g_ntf_dirty = 1; }
-        if (edge) { ntf_dismiss_row(nr); xrt_haptic(1, 0.3f, 20); }
-        return 1;
+        if (edge) { ntf_dismiss_row(nr); xrt_haptic(1, 0.3f, 20); return 2; }
+        return 1; // notification owns hover, but keep sampling for its trigger edge
     }
     if (g_opt_dirty) opt_render();
     float o[3] = {in->aim_pos[1][0], in->aim_pos[1][1], in->aim_pos[1][2]};
@@ -2687,10 +2976,14 @@ int xrt_options_input(const xr_input *in) {
     int row;
     if (!opt_hit(o, d, &dist, &row)) {
         if (g_opt_hover != -1) { g_opt_hover = -1; g_opt_dirty = 1; }
-        return 0;
+        return 1; // the options menu is modal even when the ray misses its panel
     }
     if (row != g_opt_hover) { g_opt_hover = row; g_opt_dirty = 1; if (row >= 0) xrt_haptic(1, 0.15f, 15); }
-    if (edge && row >= 0) { opt_activate(row); xrt_haptic(1, 0.35f, 25); }
+    if (edge && row >= 0) {
+        opt_activate(row);
+        xrt_haptic(1, 0.35f, 25);
+        if (!g_opt_open) return 2; // Close row: gate its still-held trigger
+    }
     if (g_opt_dirty) opt_render();
     return 1;
 }
@@ -2921,6 +3214,11 @@ static int ntf_frame(int in_match) {
         g_ntf_quad.pose.position.x = tab[0] + c * lx + s_ * lz - upx * h2;
         g_ntf_quad.pose.position.y = tab[1] + ly - upy * h2;
         g_ntf_quad.pose.position.z = tab[2] - s_ * lx + c * lz - upz * h2;
+        float f = xrt_hud_distance(), rlz = tab[4] + 0.10f; // HUD distance, as for the panels
+        float ref[3] = {tab[0] + s_ * rlz, tab[1] + 0.70f, tab[2] + c * rlz};
+        g_ntf_quad.pose.position.x = ref[0] + (g_ntf_quad.pose.position.x - ref[0]) * f;
+        g_ntf_quad.pose.position.y = ref[1] + (g_ntf_quad.pose.position.y - ref[1]) * f;
+        g_ntf_quad.pose.position.z = ref[2] + (g_ntf_quad.pose.position.z - ref[2]) * f;
     } else { // menus: to the right of the menu screen
         XrPosef p = panel_pose(1.85f, 0.15f);
         float sy = sinf(g_anchor_yaw), cy = cosf(g_anchor_yaw), off = g_menu_halfw + 0.45f;
@@ -3051,7 +3349,7 @@ static int pointer_quads(XrCompositionLayerQuad *L, const float head[3], int tab
     v_norm(d);
     float len = 1.5f, ux, uy, dist;
     int hit = 0;
-    if (xrt_panel_hit(o, d, &ux, &uy, &dist)) { len = dist; hit = 1; }
+    if (xrt_panel_hit(o, d, &ux, &uy, &dist, NULL)) { len = dist; hit = 1; }
     { float od; int orow; if (opt_hit(o, d, &od, &orow) && (!hit || od < len)) { len = od; hit = 1; } }
     { float nd; int nrow; if (ntf_hit(o, d, &nd, &nrow) && (!hit || nd < len)) { len = nd; hit = 1; } }
     float tab[5];
@@ -3197,14 +3495,23 @@ int xrt_stereo_begin(void) {
     XrFrameWaitInfo fwi = {XR_TYPE_FRAME_WAIT_INFO};
     g_fs.type = XR_TYPE_FRAME_STATE;
     g_fs.next = NULL;
-    if (XR_FAILED(p_xrWaitFrame(g_sess, &fwi, &g_fs))) return 0;
+    if (XR_FAILED(p_xrWaitFrame(g_sess, &fwi, &g_fs))) {
+        xr_pointer_cancel("stereo xrWaitFrame failed", 1);
+        return 0;
+    }
     XrFrameBeginInfo fbi = {XR_TYPE_FRAME_BEGIN_INFO};
-    if (XR_FAILED(p_xrBeginFrame(g_sess, &fbi))) return 0;
+    if (XR_FAILED(p_xrBeginFrame(g_sess, &fbi))) {
+        xr_pointer_cancel("stereo xrBeginFrame failed", 1);
+        return 0;
+    }
     g_frame_open = 1;
     g_frame_render = 0;
     g_eye_copied[0] = g_eye_copied[1] = 0;
     g_ui_copied = 0;
-    if (!g_fs.shouldRender) return 0;
+    if (!g_fs.shouldRender) {
+        xr_pointer_cancel("stereo frame not rendered", 1);
+        return 0;
+    }
     XrViewLocateInfo li = {XR_TYPE_VIEW_LOCATE_INFO};
     li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     li.displayTime = g_fs.predictedDisplayTime;
@@ -3213,8 +3520,14 @@ int xrt_stereo_begin(void) {
     uint32_t n = 0;
     g_views[0].type = g_views[1].type = XR_TYPE_VIEW;
     g_views[0].next = g_views[1].next = NULL;
-    if (XR_FAILED(p_xrLocateViews(g_sess, &li, &vs, 2, &n, g_views)) || n != 2) return 0;
-    if (!(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return 0;
+    if (XR_FAILED(p_xrLocateViews(g_sess, &li, &vs, 2, &n, g_views)) || n != 2) {
+        xr_pointer_cancel("stereo view tracking unavailable", 1);
+        return 0;
+    }
+    if (!(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+        xr_pointer_cancel("stereo view orientation invalid", 1);
+        return 0;
+    }
     g_frame_render = 1;
     g_eye = 0;
     // Head = midpoint of the eyes, orientation of the left eye.
@@ -3348,6 +3661,16 @@ static void end_stereo_frame(ID3D11Texture2D *bb) {
         proj.views = pv;
         layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&proj;
     }
+    { // First real tabletop frame, not the flat menus (and not Ranked): show once per run.
+        static int shown;
+        if (!shown && g_frame_render && proj.viewCount == 2) {
+            char hint[160];
+            shown = 1;
+            sprintf_s(hint, sizeof(hint), "Press the %s thumbstick to open the VR menu. Select Controls for the full guide.",
+                      xrt_left_handed() ? "right" : "left");
+            vr_notify(hint, 0, 10);
+        }
+    }
     int budget = g_max_layers - 1 - 2 - (g_mr == 2) - 2; // projection + laser/dot (+ passthrough) + options menu + notifications
     if (budget > 15) budget = 15;
     int npq = (g_frame_render && g_ui_copied && budget > 0) ? layout_quads(pquads, budget) : 0;
@@ -3405,6 +3728,7 @@ static void end_stereo_frame(ID3D11Texture2D *bb) {
 // runtime releases the shared swapchain textures before the process exits.
 // Everything VR stops afterwards (g_state -1).
 void xrt_shutdown(const char *why) {
+    xr_pointer_cancel("VR shutdown", 0);
     if (g_state != 1) return;
     g_state = -1;
     logf_("XR: shutting down (%s)", why);
@@ -3471,6 +3795,18 @@ void xrt_game_mode(const char *mode) {
 
 // Called by the patched bytecode before every present, with the game's back
 // buffer (a new reference from IDXGISwapChain::GetBuffer, released here).
+// The game's error screen (ui.ExceptionReportEnvironment) came up.
+static int g_game_error_open;
+void xrt_game_error(void) {
+    g_game_error_open = 1;
+    logf_("XR: the game reported an error (frame open %d, stereo %d)", g_frame_open, g_stereo);
+}
+void xrt_game_error_end(void) { // ExceptionReportEnvironment.dispose: back to the game
+    if (g_game_error_open) logf_("XR: the game's error screen closed");
+    g_game_error_open = 0;
+}
+int xrt_game_error_open(void) { return g_game_error_open; }
+
 void xr_theater_frame(void *backbuffer) {
     ID3D11Texture2D *bb = (ID3D11Texture2D *)backbuffer;
     if (!bb) return;
@@ -3495,6 +3831,7 @@ void xr_theater_frame(void *backbuffer) {
         if (g_running) {
             if (bb_fits(bb)) submit(bb);
             else {
+                xr_pointer_cancel("back buffer exceeds XR swapchain", 1);
                 static int warned;
                 if (!warned) { warned = 1; logf_("XR: back buffer grew past the swapchain size; theater paused"); }
             }

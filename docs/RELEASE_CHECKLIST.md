@@ -16,7 +16,11 @@ Tick each line in the release's issue / PR.
 ## Match
 - [ ] Tabletop shows; grip pan, two-hand zoom/rotate, right stick rotate/zoom, Y reset view
 - [ ] A click selects a unit; A drag draws the box at ground height and selects units
+- [ ] Select one unit, hold the other trigger and Select another: both stay selected; repeat on a selected unit to remove it
+- [ ] Unit Tallies: an ordinary click cycles one unit; other trigger + click adds every unit of that type to the current selection
 - [ ] Trigger with units selected gives an order; trigger with nothing selected selects a building
+- [ ] With units selected, other trigger + pointer trigger on the ground still gives an order; Build and other HUD clicks are unchanged
+- [ ] The selection modifier clears across VR-menu/tracking interruptions, produces no click while controls stay held, and mirrors in left-handed mode
 - [ ] Build menu on the left hand; pick a building, preview follows the laser, trigger places it
 - [ ] B cancels a building preview
 - [ ] Unit list click centres the view on the unit (pan offset cleared)
@@ -24,12 +28,14 @@ Tick each line in the release's issue / PR.
 - [ ] Map edge fades smoothly when turning the head
 
 ## Pause and dialogs
-- [ ] Escape (left menu button) opens the pause menu
+- [ ] X and right stick click each open the pause menu; left menu also works when the runtime exposes it
 - [ ] Quit to Title shows the confirmation dialog; OK returns to the flat title menu (no "SORRY" error)
 - [ ] Save and load from the pause menu
 
 ## VR options (left thumbstick click)
-- [ ] Every row changes and is saved (restart and check `NorthgardVR_settings.txt`)
+- [ ] The top line names the pause shortcut; Controls opens, every row is readable, Back returns
+- [ ] First tabletop entry after launch shows one notification pointing to left stick + Controls; a later match in the same run does not repeat it
+- [ ] Every setting row changes and is saved (restart and check `NorthgardVR_settings.txt`)
 - [ ] Log → Open folder opens Explorer
 
 ## Multiplayer rules (debug: `NorthgardVR_mode.txt`)

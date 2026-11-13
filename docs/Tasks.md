@@ -1,7 +1,7 @@
 # NorthgardVR – Tasks & Milestones
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done · `[?]` needs decision · `[-]` parked until confirmed real
-Owner: **(A)** Alex (headset / decision) · **(C)** Claude (simulator / code)
+Owner: **(A)** Alex (headset / decision) · **(C)** Codex (simulator / code)
 
 ---
 
@@ -12,6 +12,10 @@ Done. Note: VD passthrough needs VD's Configure colour to match the mod's Key co
 ## Milestone 1 – Known bugs
 
 - [ ] (C) Snow / weather particles show in winter even with Weather = Off
+- [x] (C) Game error screen ("a problem occurred"): the exception message and stack now go to NorthgardVR_log.txt (`GAME ERROR:` lines), and VR keeps the match render size while the screen is up, so "Continue" returns to a working tabletop (before: the map drew in a corner with white around it). Simulator: test error in a match and in the main menu, Continue worked both times (debug tool: NorthgardVR_throw.flag)
+- [ ] (A) Co-op conquest (VR host + desktop player): the joiner hung on the last loading step and got "Failed to connect" (Retry worked), and the host started paused. Try once more, and once with both players on the normal game, to see if VR is involved
+- [ ] (C) Co-op conquest: error after "Return to Conquest Map" (2026-11-12) — cause unknown; next time the log has the error text
+- [ ] (C) The VR pointer stayed off on the error screen in one simulator run (worked for Alex): check
 - [x] (C) Quitting from the game menu now shuts VR down first (tested twice in the simulator: game ends, Steam back to PLAY after a Steam restart). Before, the menu quit skipped the VR shutdown and could freeze the desktop.
 - [ ] (A) On the headset (VD): quit from the main menu and check Steam goes back to PLAY by itself
 - [x] (C) Lore window closes with a laser click (simulator; the click landed outside the window, which also closes it – X itself not separately confirmed)
@@ -34,6 +38,14 @@ Done. Note: VD passthrough needs VD's Configure colour to match the mod's Key co
 - [x] (C) Map fades out with distance in a circle around you instead of the game's straight far-plane edge (eye cameras get a 1.6× longer far plane; fade 55–90 % of it). Simulator: smooth edge when turning the head
 - [x] (C) Pause menu "Are you sure?" dialog (Quit to Title) now shows in VR in place of the buttons, same size; OK/Cancel work with the laser (simulator)
 - [x] (C) "Quit to Title" leaves the 3D view and goes back to the flat menu screen. Stereo now also needs the match itself running (Game.onUpdate / Game.render), not just its camera; the flat screen after a match also submits a cleared eye layer (else the simulator kept the old map frozen in view); the laser pauses ~2 s during the switch (a laser click carried over into the teardown made the game show "SORRY, a problem occurred"). Simulator: quit → title menu, laser works on it, loading again → 3D map
+- [x] (C) HUD row under the top bar: fame + military/diplomacy, selection, territory in fixed slots (nothing moves when the selection changes, no overlap); minimap + calendar on their own to the right of everything; notifications stay on the left. Simulator: Town Hall and villager selections, panels stay put
+- [x] (C) VR options "HUD distance" (Near 75 % / Normal 88 % default / Far 100 %): panels keep their size and move towards you. Simulator: all three
+- [x] (C) Wrist panel aims from its middle (it looked over your head) at your eyes; VR options "Hand menu aim" offset (−20 … +10 cm). Simulator: setting cycles; the angle itself needs the headset
+- [ ] (A) Headset: the new HUD row, HUD distance and Hand menu aim feel right
+- [x] (C) Dragging the map in VR also moves the game camera there (same call as a minimap click), so camera-tied effects such as weather fog follow; the view doesn't jump. Simulator: drags move the game camera, pan offset goes to 0
+- [x] (C) Controls are discoverable in VR: X and right stick click open the game pause menu; the VR options menu names the shortcut at the top and has a Controls page with Back; the first real tabletop frame after launch shows one VR notification pointing to left stick + Controls. Simulator: notification captured on first stereo entry, guide and Back exercised with the laser, X opened Pause, right stick still toggled Pause
+- [~] (C) Off-hand trigger selection modifier: the logical non-pointer trigger latches the game's `Hotkeys.addUnit` (Shift) through a primary select click/drag; on `ui.win.units.AllUnits`, a modified click becomes Shift+right-click so the game adds the whole type. Pointer-trigger orders and other HUD clicks stay unchanged; mouse/Shift/Escape state clears on focus, tracking, menu, render, window and shutdown transitions, with held controls required to return neutral. Simulator (right- and left-handed): normal tally click cycled one unit, the modified tally path selected a group, a modified map primary click held Shift through mouse-up, pointer-trigger map orders stayed ordinary right-clicks, and opening the VR menu mid-gesture released mouse then Shift without a repeat click. Individual unit add/remove and additive drag-box outcomes remain to be verified
+- [ ] (A) Headset, late game with weather: the fog clears where you drag to, without a minimap click. Needs an install whose hlpatch.exe has the camera hook (the game folder's hlpatch.exe is from 2026-11-04, so the launcher's vrboot.dat on 2026-11-05 lacked it)
 - [ ] (A) Check on the headset: the new buttons feel right, the fade distance looks good when zoomed in/out, Quit to Title in VD
 - Note: in the simulator, pressing A also pulls the trigger; the mod ignores a trigger press while A is down
 
@@ -51,7 +63,7 @@ Done. Note: VD passthrough needs VD's Configure colour to match the mod's Key co
 
 ## Milestone 3 – Install & update
 
-- [~] (C) GitHub Actions (.github/workflows/release.yml): runs scripts/make_release.sh (tested here and from a clean clone); builds on every push, attaches the zip to a pre-release for tags v*. Not yet run on GitHub
+- [x] (C) GitHub Actions (.github/workflows/release.yml): runs scripts/make_release.sh on main, `v*` tags, pull requests and manual dispatch; attaches the zip to a GitHub release for tags. Main run 41765514049 and `v0.9.0` tag run 41772237123 both succeeded on GitHub (2026-11-04); the public asset was created
 - [x] (C) Standalone launcher `NorthgardVR.exe` (native/launcher): re-patches with `hlpatch.exe` when hlboot.dat changed (game update) or vrboot.dat is missing, then starts `Northgard.exe vrboot.dat`; if patching fails it offers the normal game. Tested on Alex's PC: first run patched (Windows hlpatch.exe, exit 0) and started VR; second run skipped patching. Failure dialog not yet tested
 - [x] (C) Windows `hlpatch.exe` builds here (Rust windows-gnu target)
 - [ ] (A) Test that the game connects to Steam (login, achievements) when started from the launcher instead of from Steam
@@ -65,18 +77,12 @@ Done. Note: VD passthrough needs VD's Configure colour to match the mod's Key co
 - [ ] (A) GPU coverage: NVIDIA plus at least one AMD tester
 - [ ] (C/A) All clans, campaign / conquest, diplomacy, tech tree, trade, Lore, events (low priority)
 - [ ] (A) 2-hour headset session including sleep/wake and alt-tab (low priority)
-- [ ] (A) Open beta: GitHub release marked "beta", bug reports via GitHub issues / Discord
+- [~] (A) Public release: `v0.9.0` is already public on GitHub; harden `v0.9.1`, smoke-test its public asset, then announce with bug reports via GitHub issues / Discord
 
 ## Milestone 5 – Public release
 
 - [x] (C) README: install (Setup + shortcut), other controllers, multiplayer/Ranked, all settings, troubleshooting, known issues
 - [x] (C) CHANGELOG.md (in the zip too); version from `make_release.sh <version>` shown in the VR options menu (top right) and the log (simulator: "0.9.0-test (Nov 4 2026)")
-- [ ] (A) Publish on GitHub Releases (+ Nexus Mods?)
+- [x] (A) `v0.9.0` published on GitHub Releases (2026-11-04); it remains the immutable baseline
+- [ ] (A) Publish and announce the hardened `v0.9.1` release (+ Nexus Mods?)
 - [ ] (A) Gameplay video / screenshots for the release page
-
-## Decided against
-
-- Code signing: releases stay unsigned; the README explains the SmartScreen "More info → Run anyway" step
-
-- Flat-screen fallback when VR fails to start
-- Contacting Shiro Games before release

@@ -19,22 +19,28 @@
 #   scaled with the table size). pitch -90 = lying flat.
 #
 # claim <classes>: windows that no panel shows (and @rest leaves out).
+#
+# Row: lines ending in "row" get fixed slots side by side (file order, left to right), centred
+# on the "@row" line (p = bottom centre, yaw, pitch; width_m = gap in metres). Each slot is its
+# width_m wide and stays put whether the panel is shown or not; a wider panel shrinks to fit.
+# "rowup" stacks a panel on top of the row member before it.
 claim ui.sel.Resources,ui.win.CooldownInfo,ui.win.Pause
 #
 # far side, above the table (top bar: fixed rects, it spans the whole screen width)
 economy       rt  -1000  0  1000  36    0.05   0.50 -0.92    0    -10   1.60
-fame_left     lt      0  0   160  36   -1.00   0.48 -0.72   30    -10   0.24
 tips          @win:ui.win.Tuto   0 0 1300 0    0.00 0.56 -1.05    0     -5   1.10
+# the row under the top bar: players (fame) with the military/diplomacy buttons on top,
+# selection, territory; minimap + calendar on their own, right of everything, angled towards you
+row           @row    0  0     0   0    0.05   0.08 -0.90    0    -10   0.04
+players       @win:ui.sel.Players     0 0 170 0    0 0 0    0  -10  0.26  row
+fame_left     lt      0  0   160  36    0 0 0    0  -10  0.24  rowup
+selection     @win:ui.win.SelectedUnitsInfos,ui.win.EntityInfos,ui.sel.*   0 0 640 0    0 0 0    0  -10  0.70  row
+territory     @win:ui.sel.ZoneInfos   0 0 320 0    0 0 0    0  -10  0.35  row
+left_hud      @win:ui.win.MiniMap,ui.win.Calendar,ui.win.CalendarTimers   0 0 275 0    1.05 0.12 -0.72  -35  -12  0.36
 # Lore, pause, dialogs and anything else: big, in front of you above the table
 center        @rest   0  0  1300   0    0.00   0.40 -0.05    0     -8   1.20
 center2       @rest   0  0  1300   0    0.55   0.40 -0.15  -25   -8   1.20
-selection     @win:ui.win.SelectedUnitsInfos,ui.win.EntityInfos,ui.sel.*   0 0 640 0   -0.32 0.08 -0.90    0  -10  0.70
-territory     @win:ui.sel.ZoneInfos   0 0 320 0    0.42 0.08 -0.88  -10  -10  0.35
-# far left
-players       @win:ui.sel.Players     0 0 170 0   -1.02 0.19 -0.68   35  -15  0.26
 notifications @win:ui.win.Notifications,ui.win.Notify,ui.win.WarNotify  0 0 430 0   -1.06 0.40 -0.80   30   -5  0.42
-# near left side, tilted towards you
-left_hud      @win:ui.win.MiniMap,ui.win.Calendar,ui.win.CalendarTimers   0 0 275 0   -0.98 -0.14 -0.08   35  -35  0.34
 # on the LEFT HAND (13th column "lhand": p/yaw/pitch relative to the controller grip;
 #   x right, y up, z towards the wrist). Unit tallies, with the build menu beside them.
 right_hud     @win:ui.win.units.AllUnits,ui.win.BuildButton   0 0 284 0   -0.02 0.05 0.03    0  -20  0.17  lhand
